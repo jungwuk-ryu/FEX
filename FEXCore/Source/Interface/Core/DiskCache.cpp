@@ -436,7 +436,7 @@ namespace DiskCache {
       return std::nullopt;
     }
 
-    XXH128_hash_t LiveGuestHash = XXH3_128bits(reinterpret_cast<void*>(GuestRIP), Header.GuestSize);
+    XXH128_hash_t LiveGuestHash = XXH3_128bits(reinterpret_cast<void*>(CTX->TranslateGuestToHost(GuestRIP)), Header.GuestSize);
     if (std::memcmp(&LiveGuestHash, &Header.GuestHash, sizeof(Header.GuestHash)) != 0) {
       // LogMan::Msg::IFmt("hash mismatch! length {:d}", Header.GuestSize);
       return std::nullopt;

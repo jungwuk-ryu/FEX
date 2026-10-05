@@ -581,7 +581,7 @@
         "DestSize": "Size"
       },
 
-      "StoreMemTSO RegisterClass:$Class, OpSize:#Size, SSA:$Value, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale": {
+      "StoreMemTSO RegisterClass:$Class, OpSize:#Size, SSA:$Value, GPR:$Addr, GPR:$Offset, OpSize:$Align, MemOffsetType:$OffsetType, u8:$OffsetScale, i1:$NeedsUnalignedHalfBarrier": {
         "Desc": ["Does a x86 TSO compatible store to memory. Offset must be Invalid()."
                 ],
         "Inline": ["Zero", "", "Memtso"],
@@ -669,7 +669,8 @@
           "Push two values to the address, incrementing the pointer in the place.",
           "Fused post-RA so doesn't have a destination."
         ],
-        "HasSideEffects": true
+        "HasSideEffects": true,
+        "DestSize": "Size"
       },
       "GPR = RMWHandle GPR:$Value": {
         "Desc": [

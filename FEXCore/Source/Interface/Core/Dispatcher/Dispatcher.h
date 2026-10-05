@@ -61,6 +61,8 @@ public:
 
   SignalDelegatorConfig MakeSignalDelegatorConfig() const;
 
+  auto GetCustomDispatchEntry() const { return CustomDispatchPtr; }
+
 protected:
   FEXCore::Context::ContextImpl* CTX;
 
@@ -69,6 +71,7 @@ protected:
 
   AsmDispatch DispatchPtr;
   JITCallback CallbackPtr;
+  void (*CustomDispatchPtr)(FEXCore::Core::CpuStateFrame*) {};
 private:
   /**
    * @name Dispatch Helper functions
@@ -94,6 +97,8 @@ private:
 
   uint64_t Start {};
   uint64_t End {};
+  uint64_t EnterCustomABIAddress {};
+  uint64_t LeaveCustomABIAddress {};
 
   // Long division helpers
   uint64_t LUDIVHandlerAddress {};
@@ -112,6 +117,7 @@ private:
   uint64_t F64FPREM1HandlerAddress {};
 
   void EmitDispatcher();
+  uint64_t EmitCustomABITransition(bool Custom);
   uint64_t GenerateABICall(FallbackABI ABI);
 
   // Inline softfloat conversion emitters - avoid FPCR save/restore overhead

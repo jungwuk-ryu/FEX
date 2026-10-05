@@ -58,6 +58,11 @@ static void* FEX_mmap(void* addr, size_t length, int prot, int flags, int fd, of
 }
 
 void VirtualName(const char* Name, void* Ptr, size_t Size) {
+#ifdef __APPLE__
+  (void)Name;
+  (void)Ptr;
+  (void)Size;
+#else
   static bool Supports {true};
   if (Supports) {
     auto Result = prctl(PR_SET_VMA, PR_SET_VMA_ANON_NAME, Ptr, Size, Name);
@@ -66,6 +71,7 @@ void VirtualName(const char* Name, void* Ptr, size_t Size) {
       Supports = false;
     }
   }
+#endif
 }
 
 static int FEX_munmap(void* addr, size_t length) {
@@ -253,17 +259,26 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
   }
 
   // Block remaining memory gaps
-  bool SupportsDontDump = true;
+  bool SupportsDontDump =
+#ifdef __APPLE__
+      false;
+#else
+      true;
+#endif
   for (auto RegionIt = Regions.begin(); RegionIt != Regions.end(); ++RegionIt) {
     auto Alloc = ::mmap(RegionIt->Ptr, RegionIt->Size, PROT_NONE, MAP_ANONYMOUS | MAP_NORESERVE | MAP_PRIVATE | MAP_FIXED_NOREPLACE, -1, 0);
 
     if (SupportsDontDump) {
+#ifdef __APPLE__
+      SupportsDontDump = false;
+#else
       // Mark these regions as don't dump so that coredump doesn't try dumping large unmapped regions.
       // Ideally coredump would be smart enough to only dump resident pages, but here we are.
       auto Result = madvise(RegionIt->Ptr, RegionIt->Size, MADV_DONTDUMP);
       if (Result == -1) {
         SupportsDontDump = false;
       }
+#endif
     }
 
     LogMan::Throw::AFmt(Alloc != MAP_FAILED, "StealMemoryRegion: mmap({}, {:x}) failed: {}", fmt::ptr(RegionIt->Ptr), RegionIt->Size, errno);
@@ -274,6 +289,13 @@ fextl::vector<MemoryRegion> StealMemoryRegion(uintptr_t Begin, uintptr_t End) {
 }
 
 fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
+#ifdef __APPLE__
+  // Wine owns the guest address space on Darwin.  The Linux allocator scans
+  // /proc/self/maps and reserves a 128-TiB range, neither of which is a valid
+  // operation inside the native macOS process.
+  (void)PageSize;
+  return {};
+#else
   size_t Bits = FEXCore::Allocator::GetHostVABits();
   if (Bits < 48) {
     return {};
@@ -287,6 +309,7 @@ fextl::vector<MemoryRegion> Setup48BitAllocatorIfExists(size_t PageSize) {
   AssignHookOverrides(PageSize);
 
   return Regions;
+#endif
 }
 
 void ReclaimMemoryRegion(const fextl::vector<MemoryRegion>& Regions) {

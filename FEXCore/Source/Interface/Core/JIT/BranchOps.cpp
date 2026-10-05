@@ -37,6 +37,7 @@ DEF_OP(CallbackReturn) {
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r2, ARMEmitter::Reg::r2, 8);
   str(ARMEmitter::XReg::x2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.gregs[X86State::REG_RSP]));
 
+  LeaveCustomABI();
   PopCalleeSavedRegisters();
 
   // Return to the thunk
@@ -79,6 +80,15 @@ DEF_OP(ExitFunction) {
   }
 
   if (IsInlineConstant(Op->NewRIP, &NewRIP) || IsInlineEntrypointOffset(Op->NewRIP, &NewRIP)) {
+    if (CTX->IsGuestTransitionTarget(NewRIP)) {
+      LoadConstant(ARMEmitter::Size::i64Bit, TMP1, NewRIP);
+      str(TMP1, STATE_PTR(CpuStateFrame, State.rip));
+      // Route through the dispatcher so the embedding-owned bitmap is loaded
+      // at execution time.  An EC page can later become x64 code without
+      // requiring every source block that targeted it to be recompiled.
+      ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.DispatcherLoopTop));
+      br(TMP2);
+    } else {
 #ifdef ARCHITECTURE_arm64ec
     if (NewRIP < EC_CODE_BITMAP_MAX_ADDRESS && RtlIsEcCode(NewRIP)) {
       str(REG_CALLRET_SP, STATE_PTR(CpuStateFrame, State.callret_sp));
@@ -185,6 +195,7 @@ DEF_OP(ExitFunction) {
 #ifdef ARCHITECTURE_arm64ec
     }
 #endif
+    }
   } else {
     ARMEmitter::ForwardLabel SkipFullLookup;
     auto RipReg = GetReg(Op->NewRIP);
@@ -243,9 +254,16 @@ DEF_OP(CondJump) {
   auto Op = IROp->C<IR::IROp_CondJump>();
 
   auto TrueTargetLabel = JumpTarget(Op->TrueBlock);
+  const bool PollTrueTarget =
+    CTX->Config.ExternalStopsEnabled && TrueTargetLabel->Backward.Location;
+  ARMEmitter::ForwardLabel SkipTrueTarget;
 
   if (Op->FromNZCV) {
-    b_OrRestart(MapCC(Op->Cond), TrueTargetLabel);
+    if (PollTrueTarget) {
+      b_OrRestart(InvertCondition(MapCC(Op->Cond)), &SkipTrueTarget);
+    } else {
+      b_OrRestart(MapCC(Op->Cond), TrueTargetLabel);
+    }
   } else {
     uint64_t Const;
     const bool isConst = IsInlineConstant(Op->Cmp2, &Const);
@@ -258,19 +276,29 @@ DEF_OP(CondJump) {
 
     if (Op->Cond == IR::CondClass::EQ) {
       LOGMAN_THROW_A_FMT(Const == 0, "CondJump: Expected 0 source");
-      cbz_OrRestart(Size, Reg, TrueTargetLabel);
+      if (PollTrueTarget) cbnz_OrRestart(Size, Reg, &SkipTrueTarget);
+      else cbz_OrRestart(Size, Reg, TrueTargetLabel);
     } else if (Op->Cond == IR::CondClass::NEQ) {
       LOGMAN_THROW_A_FMT(Const == 0, "CondJump: Expected 0 source");
-      cbnz_OrRestart(Size, Reg, TrueTargetLabel);
+      if (PollTrueTarget) cbz_OrRestart(Size, Reg, &SkipTrueTarget);
+      else cbnz_OrRestart(Size, Reg, TrueTargetLabel);
     } else if (Op->Cond == IR::CondClass::TSTZ) {
       LOGMAN_THROW_A_FMT(Const < 64, "CondJump: Expected valid bit source");
-      tbz_OrRestart(Reg, Const, TrueTargetLabel);
+      if (PollTrueTarget) tbnz_OrRestart(Reg, Const, &SkipTrueTarget);
+      else tbz_OrRestart(Reg, Const, TrueTargetLabel);
     } else if (Op->Cond == IR::CondClass::TSTNZ) {
       LOGMAN_THROW_A_FMT(Const < 64, "CondJump: Expected valid bit source");
-      tbnz_OrRestart(Reg, Const, TrueTargetLabel);
+      if (PollTrueTarget) tbz_OrRestart(Reg, Const, &SkipTrueTarget);
+      else tbnz_OrRestart(Reg, Const, TrueTargetLabel);
     } else {
       LOGMAN_THROW_A_FMT(false, "CondJump expected simple condition");
     }
+  }
+
+  if (PollTrueTarget) {
+    EmitSuspendInterruptCheck(GuestRIPForJumpTarget(TrueTargetLabel));
+    b_OrRestart(TrueTargetLabel);
+    (void)Bind(&SkipTrueTarget);
   }
 
   PendingTargetLabel = JumpTarget(Op->FalseBlock);
@@ -318,7 +346,7 @@ DEF_OP(Syscall) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<uint64_t, void*, void*, void*>(ARMEmitter::Reg::r3);
   } else {
-    blr(ARMEmitter::Reg::r3);
+    CallHostFunction(ARMEmitter::Reg::r3);
   }
 
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, SPOffset);
@@ -340,7 +368,14 @@ DEF_OP(Syscall) {
 
   const auto OSABI = CTX->SyscallHandler->GetOSABI();
 
-  if (OSABI != FEXCore::HLE::SyscallOSABI::OS_GENERIC) {
+  if (OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC_STOP) {
+    ResetStack();
+    LoadConstant(ARMEmitter::Size::i32Bit, TMP1,
+                 FEXCore::ToUnderlying(Core::ExternalStopReason::Syscall));
+    str(TMP1.W(), STATE_PTR(CpuStateFrame, ExternalStop));
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
+    br(TMP2);
+  } else if (OSABI != FEXCore::HLE::SyscallOSABI::OS_GENERIC) {
     // Move result to its destination register.
     // Only if `NORETURNEDRESULT` wasn't set, otherwise we might overwrite the CPUState refilled with `FillStaticRegs`
     mov(ARMEmitter::Size::i64Bit, GetReg(Node), ARMEmitter::Reg::r0);
@@ -366,7 +401,7 @@ DEF_OP(Thunk) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
   } else {
-    blr(ARMEmitter::Reg::r2);
+    CallHostFunction(ARMEmitter::Reg::r2);
   }
 
   PopDynamicRegs();
@@ -380,7 +415,8 @@ DEF_OP(Thunk) {
 DEF_OP(ValidateCode) {
   auto Op = IROp->C<IR::IROp_ValidateCode>();
   auto OldCode = Op->CodeOriginal.data();
-  auto Base = GetReg(Op->Header.Args[0]).X();
+  auto GuestBase = GetReg(Op->Header.Args[0]);
+  auto Base = TranslateGuestAddress(GuestBase, TMP3, TMP4).X();
   int len = Op->CodeLength;
   int Offset = 0;
   ARMEmitter::ForwardLabel Fail;
@@ -441,7 +477,7 @@ DEF_OP(ThreadRemoveCodeEntry) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
   } else {
-    blr(ARMEmitter::Reg::r2);
+    CallHostFunction(ARMEmitter::Reg::r2);
   }
   FillStaticRegs();
 
@@ -473,7 +509,7 @@ DEF_OP(CPUID) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<__uint128_t, void*, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
   } else {
-    blr(ARMEmitter::Reg::r3);
+    CallHostFunction(ARMEmitter::Reg::r3);
   }
 
   if (!TMP_ABIARGS) {
@@ -508,7 +544,7 @@ DEF_OP(XGetBV) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<uint64_t, void*, uint32_t>(ARMEmitter::Reg::r2);
   } else {
-    blr(ARMEmitter::Reg::r2);
+    CallHostFunction(ARMEmitter::Reg::r2);
   }
 
   if (!TMP_ABIARGS) {

@@ -3,11 +3,18 @@
 #include <FEXCore/Utils/CompilerDefs.h>
 #include <FEXCore/Utils/EnumOperators.h>
 #include <FEXCore/Utils/LogManager.h>
+#include <FEXCore/Utils/TypeDefines.h>
 
 #ifndef _WIN32
 #include <stdlib.h>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#include <string.h>
+#else
 #include <malloc.h>
+#endif
 #include <sys/mman.h>
+#include <unistd.h>
 #else
 #define NTDDI_VERSION 0x0A000005
 #include <memoryapi.h>
@@ -19,6 +26,34 @@
 #include <sys/types.h>
 
 namespace FEXCore::Allocator {
+inline size_t GetHostPageSize() {
+#ifndef _WIN32
+  static const size_t HostPageSize = []() {
+    const long Result = ::sysconf(_SC_PAGESIZE);
+    return Result > 0 ? static_cast<size_t>(Result) : FEXCore::Utils::FEX_PAGE_SIZE;
+  }();
+  return HostPageSize;
+#else
+  return FEXCore::Utils::FEX_PAGE_SIZE;
+#endif
+}
+
+FEX_DEFAULT_VISIBILITY void BeginJITWrite();
+FEX_DEFAULT_VISIBILITY void EndJITWrite();
+
+class ScopedJITWrite final {
+public:
+  ScopedJITWrite() {
+    BeginJITWrite();
+  }
+  ~ScopedJITWrite() {
+    EndJITWrite();
+  }
+
+  ScopedJITWrite(const ScopedJITWrite&) = delete;
+  ScopedJITWrite& operator=(const ScopedJITWrite&) = delete;
+};
+
 enum class ProtectOptions : uint32_t {
   None = 0,
   Read = (1U << 0),
@@ -125,7 +160,40 @@ inline void VirtualFree(void* Ptr, size_t Size) {
   FEXCore::Allocator::munmap(Ptr, Size);
 }
 inline void VirtualDontNeed(void* Ptr, size_t Size, bool Recommit = true) {
+#ifdef __APPLE__
+  // Unlike Linux, Darwin's MADV_DONTNEED does not immediately discard old
+  // contents. Lookup caches, the call/return predictor and bitmap allocators
+  // require zeroes before this call returns. The caller owns a writable range
+  // exclusively; keep its mapping and permissions, including neighboring bytes
+  // when a 4-KiB guest-sized range shares a larger host page.
+  (void)Recommit;
+  if (!Size) return;
+  const uintptr_t Address = reinterpret_cast<uintptr_t>(Ptr);
+  if (!Ptr || Size > UINTPTR_MAX - Address) ::abort();
+  const size_t PageSize = GetHostPageSize();
+  size_t Prefix = (PageSize - Address % PageSize) % PageSize;
+  if (Prefix > Size) Prefix = Size;
+  auto* Cursor = static_cast<unsigned char*>(Ptr);
+  if (Prefix) {
+    ::memset(Cursor, 0, Prefix);
+    Cursor += Prefix;
+    Size -= Prefix;
+  }
+  const size_t WholePages = Size - Size % PageSize;
+  if (WholePages) {
+#ifdef MADV_ZERO
+    // Older kernels and unsupported mapping types can reject MADV_ZERO.
+    // Do not substitute another lazy advice or silently keep stale pointers.
+    if (::madvise(Cursor, WholePages, MADV_ZERO) != 0)
+#endif
+      ::memset(Cursor, 0, WholePages);
+    Cursor += WholePages;
+    Size -= WholePages;
+  }
+  if (Size) ::memset(Cursor, 0, Size);
+#else
   ::madvise(reinterpret_cast<void*>(Ptr), Size, MADV_DONTNEED);
+#endif
 }
 inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
   int prot {PROT_NONE};
@@ -143,7 +211,13 @@ inline bool VirtualProtect(void* Ptr, size_t Size, ProtectOptions options) {
 }
 
 inline void VirtualTHPControl(const void* Ptr, size_t Size, THPControl Control) {
+#ifdef __APPLE__
+  (void)Ptr;
+  (void)Size;
+  (void)Control;
+#else
   ::madvise(const_cast<void*>(Ptr), Size, Control == THPControl::Enable ? MADV_HUGEPAGE : MADV_NOHUGEPAGE);
+#endif
 }
 
 #endif

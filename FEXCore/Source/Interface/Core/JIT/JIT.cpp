@@ -498,6 +498,7 @@ void Arm64JITCore::Op_Unhandled(const IR::IROp_Header* IROp, IR::Ref Node) {
 }
 
 static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, bool Call) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uintptr_t CallerAddress = JumpThunkStartAddress + Record->CallerOffset;
   auto BranchOffset = JumpThunkStartAddress / 4 - CallerAddress / 4;
@@ -516,6 +517,7 @@ static void DirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record, 
 }
 
 static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   uintptr_t JumpThunkStartAddress = reinterpret_cast<uintptr_t>(Record) - 0x10;
   uint32_t BranchInst = 0;
   ARMEmitter::Emitter BranchEmit(reinterpret_cast<uint8_t*>(&BranchInst), 4);
@@ -529,12 +531,17 @@ static void IndirectBlockDelinker(FEXCore::Context::ExitFunctionLinkData* Record
 }
 
 uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEXCore::Context::ExitFunctionLinkData* Record) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   auto Thread = Frame->Thread;
+  auto CTX = static_cast<Context::ContextImpl*>(Thread->CTX);
   bool TFSet = Thread->CurrentFrame->State.flags[X86State::RFLAG_TF_RAW_LOC];
   uintptr_t HostCode {};
   auto GuestRip = Record->GuestRIP;
 
-  if (TFSet) {
+  if (CTX->IsGuestTransitionTarget(GuestRip)) {
+    Frame->State.rip = GuestRip;
+    return Frame->Pointers.DispatcherLoopTop;
+  } else if (TFSet) {
     // If TF is set, the cache must be skipped as different code needs to be generated.
     Frame->State.rip = GuestRip;
     return Frame->Pointers.DispatcherLoopTop;
@@ -542,13 +549,13 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
     {
       // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
       auto lk_inval =
-        GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+        GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
       HostCode = Thread->LookupCache->FindBlock(Thread, GuestRip);
     }
     if (!HostCode) {
       // Hold a reference to the code buffer, to avoid linking unmapped code if compilation triggers a recreation.
       auto CodeBuffer = static_cast<Arm64JITCore*>(Thread->CPUBackend.get())->CurrentCodeBuffer;
-      HostCode = static_cast<Context::ContextImpl*>(Thread->CTX)->CompileBlock(Frame, GuestRip, 0);
+      HostCode = CTX->CompileBlock(Frame, GuestRip, 0);
       if (Thread->LookupCache->Shared != CodeBuffer->LookupCache.get()) {
         return HostCode;
       }
@@ -565,7 +572,7 @@ uint64_t Arm64JITCore::ExitFunctionLink(FEXCore::Core::CpuStateFrame* Frame, FEX
   ExpectedKnownCallMarkerEmit.adr(TMP1, 0xC);
 
   // Guard the LookupCache lock with the code invalidation mutex, to avoid issues with forking
-  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(static_cast<Context::ContextImpl*>(Thread->CTX)->CodeInvalidationMutex, Thread);
+  auto lk_inval = GuardSignalDeferringSection<std::shared_lock>(CTX->CodeInvalidationMutex, Thread);
 
   // Lock here is necessary to prevent simultaneous linking and delinking
   auto lk = Thread->LookupCache->AcquireWriteLock();
@@ -763,7 +770,27 @@ void Arm64JITCore::EmitTFCheck() {
   (void)Bind(&l_TFUnset);
 }
 
-void Arm64JITCore::EmitSuspendInterruptCheck() {
+void Arm64JITCore::EmitSuspendInterruptCheck(uint64_t GuestRIP) {
+  if (CTX->Config.ExternalStopsEnabled) {
+    ARMEmitter::ForwardLabel NoExternalSuspend;
+
+    ldr(TMP1, STATE_PTR(CpuStateFrame, ExternalSuspendDoorbell));
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &NoExternalSuspend);
+    ldar(TMP1.W(), TMP1);
+    (void)cbz(ARMEmitter::Size::i32Bit, TMP1, &NoExternalSuspend);
+
+    ResetStack();
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, GuestRIP);
+    str(TMP1, STATE_PTR(CpuStateFrame, State.rip));
+    LoadConstant(ARMEmitter::Size::i32Bit, TMP1,
+                 FEXCore::ToUnderlying(Core::ExternalStopReason::Suspend));
+    str(TMP1.W(), STATE_PTR(CpuStateFrame, ExternalStop));
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
+    br(TMP2);
+
+    (void)Bind(&NoExternalSuspend);
+  }
+
   if (CTX->Config.NeedsPendingInterruptFaultCheck) {
     // Trigger a fault if there are any pending interrupts
     // Used only for suspend on WIN32 at the moment
@@ -789,7 +816,7 @@ void Arm64JITCore::EmitSuspendInterruptCheck() {
 #endif
 }
 
-void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF) {
+void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF, uint64_t GuestRIP) {
   // Get the address of the JITCodeHeader and store in to the core state.
   // Two instruction cost, each 1 cycle.
   adr_OrRestart(TMP1, &HeaderLabel);
@@ -810,7 +837,7 @@ void Arm64JITCore::EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool C
     }
   }
 
-  EmitSuspendInterruptCheck();
+  EmitSuspendInterruptCheck(GuestRIP);
 }
 
 
@@ -869,22 +896,25 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 
   uint32_t SSACount = IR->GetSSACount();
   JumpTargets.clear();
+  JumpTargetRIPs.clear();
   CallReturnTargets.clear();
   PendingJumpThunks.clear();
   JumpTargets.resize(IR->GetHeader()->BlockCount, {});
+  JumpTargetRIPs.resize(IR->GetHeader()->BlockCount, {});
   Relocations.resize(PrevNumAllocations, FEXCore::CPU::Relocation::Default()); // Discard any relocations generated from a previous attempt
 
   CodeData.EntryPoints.clear();
 
   // Fairly excessive buffer range to make sure we don't overflow
   // One page baseline, plus SSANodeMultipler bytes, plus another page for guard page.
-  const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE * 2 + SSACount * SSANodeMultiplier, FEXCore::Utils::FEX_PAGE_SIZE);
+  const uint32_t HostGuardSize = FEXCore::Allocator::GetHostPageSize();
+  const uint32_t DesiredBufferRange = AlignUp(FEXCore::Utils::FEX_PAGE_SIZE + HostGuardSize + SSACount * SSANodeMultiplier, HostGuardSize);
 
   // JIT output is first written to a temporary buffer and later relocated to the CodeBuffer.
   // This minimizes lock contention of CodeBufferWriteMutex.
   auto TempCodeBufferInfo = TempCodeBufferAllocator.ReownOrClaimBufferWithSize(DesiredBufferRange);
   auto TempCodeBuffer = TempCodeBufferInfo.Ptr;
-  const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - FEXCore::Utils::FEX_PAGE_SIZE;
+  const uint32_t UsableBufferRange = TempCodeBufferInfo.Size - HostGuardSize;
 
   SetBuffer(TempCodeBuffer, UsableBufferRange);
 
@@ -937,19 +967,19 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
     {
       const auto Node = IR->GetID(BlockNode);
       const auto Target = &JumpTargets[BlockIROp->ID];
+      const uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
+      JumpTargetRIPs[BlockIROp->ID] = BlockStartRIP;
 
       // if there's a pending branch, and it is not fall-through
       if (PendingTargetLabel && PendingTargetLabel != Target) {
         if (PendingTargetLabel->Backward.Location) {
-          EmitSuspendInterruptCheck();
+          EmitSuspendInterruptCheck(GuestRIPForJumpTarget(PendingTargetLabel));
         }
         b_OrRestart(PendingTargetLabel);
         PendingTargetLabel = nullptr;
       }
 
       if (BlockIROp->EntryPoint) {
-        uint64_t BlockStartRIP = Entry + BlockIROp->GuestEntryOffset;
-
         const auto IsReturnTarget = CallReturnTargets.try_emplace(Node).first;
         if (PendingTargetLabel) {
           // If there is a fallthrough branch to this block, skip over the entrypoint code.
@@ -964,7 +994,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
         CodeData.EntryPoints.emplace(BlockStartRIP, GetCursorAddress<uint8_t*>());
         DebugData->GuestOpcodes.push_back({BlockIROp->GuestEntryOffset, GetCursorAddress<uint8_t*>() - CodeData.BlockBegin});
 
-        EmitEntryPoint(JITCodeHeaderLabel, CheckTF);
+        EmitEntryPoint(JITCodeHeaderLabel, CheckTF, BlockStartRIP);
       }
 
       if (PendingCallReturnTargetLabel) {
@@ -977,7 +1007,10 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
       BindOrRestart(Target);
     }
 
+    // An entry or join may arrive without the predecessor's temporary GPRs.
+    ReusableMappedBase.reset();
     for (auto [CodeNode, IROp] : IR->GetCode(BlockNode)) {
+      PrepareMappedAddressReuse(IROp);
       switch (IROp->Op) {
 #define REGISTER_OP(op, x) \
   case FEXCore::IR::IROps::OP_##op: Op_##x(IROp, CodeNode); break
@@ -997,7 +1030,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
   // Make sure last branch is generated. It certainly can't be eliminated here.
   if (PendingTargetLabel) {
     if (PendingTargetLabel->Backward.Location) {
-      EmitSuspendInterruptCheck();
+      EmitSuspendInterruptCheck(GuestRIPForJumpTarget(PendingTargetLabel));
     }
     b_OrRestart(PendingTargetLabel);
   }
@@ -1158,6 +1191,7 @@ CPUBackend::CompiledCode Arm64JITCore::CompileCode(uint64_t Entry, uint64_t Size
 }
 
 CPUBackend::CompiledCode Arm64JITCore::LoadCachedCode(std::span<const uint8_t> HostBytes) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   // we stored it aligned, better still be?
   LOGMAN_THROW_A_FMT(HostBytes.size() % 16 == 0, "Needs to be 16B aligned!");
   auto AllocatedInfo = AllocateCodeBufferInSharedCache(HostBytes.size());

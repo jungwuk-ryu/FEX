@@ -268,6 +268,14 @@ static_assert(offsetof(CPUState, pf_raw) % 8 == 0, "pf_raw must be 8-byte aligne
 
 struct InternalThreadState;
 
+enum class ExternalStopReason : uint32_t {
+  None = 0,
+  Transition = 1,
+  Syscall = 2,
+  Suspend = 3,
+  InvalidCustomABI = 4,
+};
+
 enum FallbackHandlerIndex {
   OPINDEX_F80CVTTO_4 = 0,
   OPINDEX_F80CVTTO_8,
@@ -414,6 +422,13 @@ struct CpuStateFrame {
    */
   uint64_t InSyscallInfo {};
 
+  /** Embedding-owned, per-execution stop state.  The suspend doorbell is a
+   * naturally aligned uint32_t supplied by the caller and remains valid until
+   * ExecuteThread returns or is abandoned through fault reconstruction. */
+  uint64_t ExternalSuspendDoorbell {};
+  ExternalStopReason ExternalStop {ExternalStopReason::None};
+  uint32_t ExternalStopReserved {};
+
   uint32_t SignalHandlerRefCounter {};
 
   struct alignas(8) SynchronousFaultDataStruct {
@@ -434,9 +449,17 @@ struct CpuStateFrame {
 
   // Pointers that the JIT needs to load to remove relocations
   JITPointers Pointers;
+
+  // Private embedding state, never derived from a guest GS base. Only the
+  // custom side's x18 is saved/restored here; Darwin owns its system value.
+  uint64_t CustomABIValue {};
+  uint64_t EnterCustomABI {};
+  uint64_t LeaveCustomABI {};
 };
 static_assert(offsetof(CpuStateFrame, State) == 0, "CPUState must be first member in CpuStateFrame");
 static_assert(offsetof(CpuStateFrame, Pointers) % 8 == 0, "JITPointers need to be aligned to 8 bytes");
+static_assert(offsetof(CpuStateFrame, CustomABIValue) % 8 == 0, "Custom ABI fields need 8-byte alignment");
+static_assert(offsetof(CpuStateFrame, LeaveCustomABI) <= 32760, "Custom ABI fields must fit scaled LDR offsets");
 static_assert(offsetof(CpuStateFrame, Pointers) + sizeof(CpuStateFrame::Pointers) <= 32760, "JITPointers maximum pointer needs to be less "
                                                                                             "than architecture maximum 32768");
 

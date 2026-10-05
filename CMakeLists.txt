@@ -36,6 +36,9 @@ set_property(CACHE FEXCORE_PROFILER_BACKEND PROPERTY STRINGS gpuvis tracy)
 option(ENABLE_GLIBC_ALLOCATOR_HOOK_FAULT "Enables glibc memory allocation hooking with fault for CI testing")
 option(USE_PDB_DEBUGINFO "Build debug info in PDB format" FALSE)
 option(BUILD_STEAM_SUPPORT "Enable Steam integration" FALSE)
+option(SWITCHYARD_DARWIN_CORE_ONLY "Build only downstream Darwin FEXCore components" FALSE)
+set(SWITCHYARD_FEX_ADAPTER_SOURCE_DIR "" CACHE PATH
+  "External Switchyard FEX adapter source directory")
 
 set(X86_32_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_32.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting i686")
 set(X86_64_TOOLCHAIN_FILE "${CMAKE_CURRENT_SOURCE_DIR}/Data/CMake/toolchain_x86_64.cmake" CACHE FILEPATH "Toolchain file for the (cross-)compiler targeting x86_64")
@@ -61,7 +64,7 @@ if (NOT CMAKE_SIZEOF_VOID_P EQUAL 8)
   message(FATAL_ERROR "Unsupported pointer size ${CMAKE_SIZEOF_VOID_P}."
     " FEX only supports 64-bit (8-byte pointer) systems."
     " If you believe this is in error, file an issue.")
-elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux"))
+elseif (NOT (WIN32 OR CMAKE_SYSTEM_NAME STREQUAL "Linux" OR APPLE))
   message(FATAL_ERROR "Unsupported system type ${CMAKE_SYSTEM_NAME}."
     " FEX only supports Linux and Windows."
     " If you believe this is in error, file an issue.")
@@ -609,14 +612,27 @@ add_subdirectory(FEXHeaderUtils/)
 add_subdirectory(CodeEmitter/)
 add_subdirectory(FEXCore/)
 
-if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT)
+if (SWITCHYARD_FEX_ADAPTER_SOURCE_DIR)
+  if (NOT SWITCHYARD_DARWIN_CORE_ONLY)
+    message(FATAL_ERROR "The downstream adapter currently requires SWITCHYARD_DARWIN_CORE_ONLY")
+  endif()
+  if (NOT EXISTS "${SWITCHYARD_FEX_ADAPTER_SOURCE_DIR}/CMakeLists.txt")
+    message(FATAL_ERROR "Invalid Switchyard FEX adapter source directory")
+  endif()
+  add_subdirectory("${SWITCHYARD_FEX_ADAPTER_SOURCE_DIR}"
+                   "${CMAKE_BINARY_DIR}/SwitchyardFEXAdapter")
+endif()
+
+if (ARCHITECTURE_arm64 AND NOT MINGW AND NOT BUILD_STEAM_SUPPORT AND NOT SWITCHYARD_DARWIN_CORE_ONLY)
   # Binfmt_misc files must be installed prior to Source/ installs
   add_subdirectory(Data/binfmts/)
 endif()
 
-add_subdirectory(Source/)
+if (NOT SWITCHYARD_DARWIN_CORE_ONLY)
+  add_subdirectory(Source/)
+endif()
 
-if (NOT BUILD_STEAM_SUPPORT)
+if (NOT BUILD_STEAM_SUPPORT AND NOT SWITCHYARD_DARWIN_CORE_ONLY)
   add_subdirectory(Data/AppConfig/)
 endif()
 

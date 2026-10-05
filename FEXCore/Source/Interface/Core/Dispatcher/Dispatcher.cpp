@@ -14,6 +14,7 @@
 #include <FEXCore/Debug/InternalThreadState.h>
 #include <FEXCore/HLE/SyscallHandler.h>
 #include <FEXCore/Utils/Event.h>
+#include <FEXCore/Utils/AllocatorHooks.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 #include <FEXHeaderUtils/Syscalls.h>
@@ -39,6 +40,7 @@ constexpr size_t MAX_DISPATCHER_CODE_SIZE = FEXCore::Utils::FEX_PAGE_SIZE * 4;
 Dispatcher::Dispatcher(FEXCore::Context::ContextImpl* ctx)
   : Arm64Emitter(ctx, FEXCore::Allocator::VirtualAlloc(MAX_DISPATCHER_CODE_SIZE, true), MAX_DISPATCHER_CODE_SIZE)
   , CTX {ctx} {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   EmitDispatcher();
 
   FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(GetBufferBase()), MAX_DISPATCHER_CODE_SIZE);
@@ -86,8 +88,19 @@ void Dispatcher::EmitDispatcher() {
   add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, ARMEmitter::Reg::rsp, 0);
   str(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
 
+  EnterCustomABI();
+
+  // The ordinary host entry receives SingleInst in w1 even when the guest
+  // register layout uses a different temporary. Do this before the fill-SRA
+  // reentry label, whose callers already supply the internal register ABI.
+  if (!TMP_ABIARGS) {
+    mov(ARMEmitter::Size::i32Bit, ENTRY_FILL_SRA_SINGLE_INST_REG, ARMEmitter::Reg::r1);
+  }
+
   ARMEmitter::ForwardLabel CompileSingleStep;
+  ARMEmitter::BiDirectionalLabel FillFromCustomEntry;
   AbsoluteLoopTopAddressFillSRA = GetCursorAddress<uint64_t>();
+  (void)Bind(&FillFromCustomEntry);
 
   FillStaticRegs();
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
@@ -146,6 +159,40 @@ void Dispatcher::EmitDispatcher() {
   // Load in our RIP
   ldr(RipReg, STATE_PTR(CpuStateFrame, State.rip));
 
+  if (CTX->HasGuestTransitionMap()) {
+    ARMEmitter::ForwardLabel NotExternalTransition;
+
+    // Reject out-of-range guest targets before indexing the embedding-owned
+    // bitmap.  Preserve NZCV because it contains live x86 flags here.
+    mrs(TMP4, ARMEmitter::SystemRegister::NZCV);
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1, CTX->Config.GuestTransitionHighestAddress);
+    cmp(ARMEmitter::Size::i64Bit, RipReg, TMP1);
+    cset(ARMEmitter::Size::i32Bit, TMP2, ARMEmitter::Condition::CC_HI);
+    msr(ARMEmitter::SystemRegister::NZCV, TMP4);
+    (void)cbnz(ARMEmitter::Size::i32Bit, TMP2, &NotExternalTransition);
+
+    LoadConstant(ARMEmitter::Size::i64Bit, TMP1,
+                 reinterpret_cast<uintptr_t>(CTX->Config.GuestTransitionBitmap));
+    lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg,
+        CTX->Config.GuestTransitionPageShift + 6);
+    add(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2,
+        ARMEmitter::ExtendedType::LSL_64, 3);
+    ldar(TMP1, TMP1);
+    lsr(ARMEmitter::Size::i64Bit, TMP2, RipReg,
+        CTX->Config.GuestTransitionPageShift);
+    lsrv(ARMEmitter::Size::i64Bit, TMP1, TMP1, TMP2);
+    (void)tbz(TMP1, 0, &NotExternalTransition);
+
+    LoadConstant(ARMEmitter::Size::i32Bit, TMP1,
+                 FEXCore::ToUnderlying(Core::ExternalStopReason::Transition));
+    str(TMP1.W(), STATE_PTR(CpuStateFrame, ExternalStop));
+    str(RipReg, STATE_PTR(CpuStateFrame, State.rip));
+    ldr(TMP2, STATE_PTR(CpuStateFrame, Pointers.ThreadStopHandlerSpillSRA));
+    br(TMP2);
+
+    (void)Bind(&NotExternalTransition);
+  }
+
 #ifdef ARCHITECTURE_arm64ec
   // Clobbers TMP1/2
   // Check the EC code bitmap incase we need to exit the JIT to call into native code.
@@ -171,6 +218,25 @@ void Dispatcher::EmitDispatcher() {
 
   ldrb(TMP1, STATE_PTR(CpuStateFrame, State.flags[X86State::RFLAG_TF_RAW_LOC]));
   (void)cbnz(ARMEmitter::Size::i32Bit, TMP1, &CompileSingleStep);
+
+  if constexpr (!FEXCore::Context::BLOCK_DEBUGGING) {
+    // Host/native reentry can already have a thread-local L1 hit. With L2
+    // disabled, going straight to NoBlock otherwise invokes the compiler's
+    // JIT-write lease, PreCompile and invalidation lock just to find this hit.
+    // Match the JIT indirect-exit lookup; EC classification and TF stay first.
+    // Neither address arithmetic nor tag comparison may alter live NZCV.
+    ARMEmitter::ForwardLabel L1Miss;
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP1, TMP2, STATE, offsetof(FEXCore::Core::CpuStateFrame, State.L1Pointer));
+    and_(ARMEmitter::Size::i64Bit, TMP2, TMP2, RipReg.R(), ARMEmitter::ShiftType::LSL,
+         FEXCore::ilog2(sizeof(LookupCache::LookupCacheEntry)));
+    add(TMP1, TMP1, TMP2);
+    ldp<ARMEmitter::IndexType::OFFSET>(TMP4, TMP2, TMP1);
+    sub(TMP2, TMP2, RipReg);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP2, &L1Miss);
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP4, &L1Miss);
+    br(TMP4);
+    (void)Bind(&L1Miss);
+  }
 
   ARMEmitter::ForwardLabel NoBlock;
 
@@ -242,6 +308,7 @@ void Dispatcher::EmitDispatcher() {
 
     ThreadStopHandlerAddress = GetCursorAddress<uint64_t>();
 
+    LeaveCustomABIForCaller();
     PopCalleeSavedRegisters();
 
     // Return from the function
@@ -293,7 +360,7 @@ void Dispatcher::EmitDispatcher() {
       if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
         GenerateIndirectRuntimeCall<uintptr_t, void*, void*>(ARMEmitter::Reg::r2);
       } else {
-        blr(ARMEmitter::Reg::r2);
+        CallHostFunction(ARMEmitter::Reg::r2);
       }
 
       if (!TMP_ABIARGS) {
@@ -326,7 +393,7 @@ void Dispatcher::EmitDispatcher() {
       if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
         GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t, uint64_t>(ARMEmitter::Reg::r4);
       } else {
-        blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP, MaxInst }
+        CallHostFunction(ARMEmitter::Reg::r4); // { CTX, Frame, RIP, MaxInst }
       }
 
       // Result is now in x0
@@ -359,7 +426,7 @@ void Dispatcher::EmitDispatcher() {
       if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
         GenerateIndirectRuntimeCall<uintptr_t, void*, void*, uint64_t>(ARMEmitter::Reg::r4);
       } else {
-        blr(ARMEmitter::Reg::r4); // { CTX, Frame, RIP }
+        CallHostFunction(ARMEmitter::Reg::r4); // { CTX, Frame, RIP }
       }
 
       // Result is now in x0
@@ -397,7 +464,15 @@ void Dispatcher::EmitDispatcher() {
 
     SpillStaticRegs(TMP1);
 
-    hlt(0);
+    if (CTX->Config.ExternalStopsEnabled) {
+      ldr(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
+      add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::r0, 0);
+      LeaveCustomABIForCaller();
+      PopCalleeSavedRegisters();
+      ret();
+    } else {
+      hlt(0);
+    }
   }
 
   {
@@ -407,7 +482,15 @@ void Dispatcher::EmitDispatcher() {
 
     SpillStaticRegs(TMP1);
 
-    brk(0);
+    if (CTX->Config.ExternalStopsEnabled) {
+      ldr(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
+      add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::r0, 0);
+      LeaveCustomABIForCaller();
+      PopCalleeSavedRegisters();
+      ret();
+    } else {
+      brk(0);
+    }
   }
 
   {
@@ -424,6 +507,7 @@ void Dispatcher::EmitDispatcher() {
     if (CTX->ExitOnHLTEnabled()) {
       ldr(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
       add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::r0, 0);
+      LeaveCustomABIForCaller();
       PopCalleeSavedRegisters();
       ret();
     } else {
@@ -447,7 +531,7 @@ void Dispatcher::EmitDispatcher() {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<void, void*, void*>(ARMEmitter::Reg::r2);
     } else {
-      blr(ARMEmitter::Reg::r2);
+      CallHostFunction(ARMEmitter::Reg::r2);
     }
 
     PauseReturnInstruction = GetCursorAddress<uint64_t>();
@@ -478,6 +562,7 @@ void Dispatcher::EmitDispatcher() {
 
     // First thing we need to move the thread state pointer back in to our register
     mov(STATE, ARMEmitter::XReg::x0);
+    EnterCustomABI();
 
     // Make sure to adjust the refcounter so we don't clear the cache now
     ldr(ARMEmitter::WReg::w2, STATE_PTR(CpuStateFrame, SignalHandlerRefCounter));
@@ -523,7 +608,7 @@ void Dispatcher::EmitDispatcher() {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<__uint128_t, uint64_t, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
     } else {
-      blr(ARMEmitter::Reg::r3);
+      CallHostFunction(ARMEmitter::Reg::r3);
     }
 
     // Result is now in x0, x1
@@ -586,6 +671,30 @@ void Dispatcher::EmitDispatcher() {
     }
   }
 
+  if (CTX->Config.CustomABITransition) {
+    Align16B();
+    CustomDispatchPtr = GetCursorAddress<decltype(CustomDispatchPtr)>();
+    PushCalleeSavedRegisters(true);
+    mov(STATE, ARMEmitter::XReg::x0);
+    // CustomABIValue is supplied by the embedding's authenticated Unix side.
+    // This is not a fresh PE NtCurrentTeb comparison and never changes x18.
+    ARMEmitter::ForwardLabel InvalidValue;
+    ldr(TMP1, STATE_PTR(CpuStateFrame, CustomABIValue));
+    (void)cbz(ARMEmitter::Size::i64Bit, TMP1, &InvalidValue);
+    eor(ARMEmitter::Size::i64Bit, TMP1, TMP1, ARMEmitter::Reg::r18);
+    (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &InvalidValue);
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r0, ARMEmitter::Reg::rsp, 0);
+    str(ARMEmitter::XReg::x0, STATE_PTR(CpuStateFrame, ReturningStackLocation));
+    mov(ARMEmitter::Size::i32Bit, ENTRY_FILL_SRA_SINGLE_INST_REG, 0);
+    (void)b(&FillFromCustomEntry);
+    (void)Bind(&InvalidValue);
+    LoadConstant(ARMEmitter::Size::i32Bit, TMP1,
+                 FEXCore::ToUnderlying(Core::ExternalStopReason::InvalidCustomABI));
+    str(TMP1.W(), STATE_PTR(CpuStateFrame, ExternalStop));
+    PopCalleeSavedRegisters();
+    ret();
+  }
+
   (void)Bind(&l_CTX);
   dc64(reinterpret_cast<uintptr_t>(CTX));
   (void)Bind(&l_Sleep);
@@ -597,6 +706,9 @@ void Dispatcher::EmitDispatcher() {
 
   FEXCore::Utils::MemberFunctionToPointerCast PMFCompileSingleStep(&FEXCore::Context::ContextImpl::CompileSingleStep);
   dc64(PMFCompileSingleStep.GetConvertedPointer());
+
+  EnterCustomABIAddress = EmitCustomABITransition(true);
+  LeaveCustomABIAddress = EmitCustomABITransition(false);
 
   Start = reinterpret_cast<uint64_t>(DispatchPtr);
   End = GetCursorAddress<uint64_t>();
@@ -636,6 +748,49 @@ void Dispatcher::ExecuteJITCallback(FEXCore::Core::CpuStateFrame* Frame, uint64_
 }
 
 #endif
+
+uint64_t Dispatcher::EmitCustomABITransition(bool Custom) {
+  if (!CTX->Config.CustomABITransition) return 0;
+  Align16B();
+  const auto Address = GetCursorAddress<uint64_t>();
+  // Also transparent to preserve_all host calls: save all NEON lanes,
+  // x0-x17, FP/LR and architectural FP/NZCV state. Darwin callees preserve
+  // x19-x28. Never restore a system x18 copy.
+  constexpr uint32_t FrameSize = 704;
+  sub(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+  for (uint32_t i = 0; i < 18; i += 2) {
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister {i}, ARMEmitter::XRegister {i + 1}, ARMEmitter::Reg::rsp, i * 8);
+  }
+  stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x29, ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 144);
+  for (uint32_t i = 0; i < 32; i += 2) {
+    stp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::QRegister {i}, ARMEmitter::QRegister {i + 1}, ARMEmitter::Reg::rsp, 160 + i * 16);
+  }
+  mrs(ARMEmitter::XReg::x0, ARMEmitter::SystemRegister::NZCV);
+  mrs(ARMEmitter::XReg::x1, ARMEmitter::SystemRegister::FPCR);
+  mrs(ARMEmitter::XReg::x2, ARMEmitter::SystemRegister::FPSR);
+  str(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, 672);
+  str(ARMEmitter::XReg::x1, ARMEmitter::Reg::rsp, 680);
+  str(ARMEmitter::XReg::x2, ARMEmitter::Reg::rsp, 688);
+  mov(ARMEmitter::XReg::x0, Custom ? 1 : 0);
+  LoadConstant(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::r1, reinterpret_cast<uintptr_t>(CTX->Config.CustomABITransition));
+  blr(ARMEmitter::Reg::r1);
+  ldr(ARMEmitter::XReg::x0, ARMEmitter::Reg::rsp, 672);
+  ldr(ARMEmitter::XReg::x1, ARMEmitter::Reg::rsp, 680);
+  ldr(ARMEmitter::XReg::x2, ARMEmitter::Reg::rsp, 688);
+  msr(ARMEmitter::SystemRegister::NZCV, ARMEmitter::XReg::x0);
+  msr(ARMEmitter::SystemRegister::FPCR, ARMEmitter::XReg::x1);
+  msr(ARMEmitter::SystemRegister::FPSR, ARMEmitter::XReg::x2);
+  for (uint32_t i = 0; i < 32; i += 2) {
+    ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::QRegister {i}, ARMEmitter::QRegister {i + 1}, ARMEmitter::Reg::rsp, 160 + i * 16);
+  }
+  for (uint32_t i = 0; i < 18; i += 2) {
+    ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XRegister {i}, ARMEmitter::XRegister {i + 1}, ARMEmitter::Reg::rsp, i * 8);
+  }
+  ldp<ARMEmitter::IndexType::OFFSET>(ARMEmitter::XReg::x29, ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 144);
+  add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, FrameSize);
+  ret();
+  return Address;
+}
 
 void Dispatcher::EmitI32ToExtF80() {
   ARMEmitter::ForwardLabel ZeroCase;
@@ -2297,7 +2452,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<float, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF32Result();
@@ -2318,7 +2473,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<double, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF64Result();
@@ -2338,7 +2493,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<double, double, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF64Result();
@@ -2360,7 +2515,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<double, double, double, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF64Result();
@@ -2381,7 +2536,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint32_t, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI16Result();
@@ -2402,7 +2557,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint32_t, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI32Result();
@@ -2423,7 +2578,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint64_t, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI64Result();
@@ -2446,7 +2601,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint64_t, uint16_t, FEXCore::VectorRegType, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI64Result();
@@ -2467,7 +2622,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<FEXCore::VectorRegType, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF80Result();
@@ -2490,7 +2645,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<FEXCore::VectorRegType, uint16_t, FEXCore::VectorRegType, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF80Result();
@@ -2513,7 +2668,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       // GenerateIndirectRuntimeCall<FEXCore::VectorRegPairType, uint16_t, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF80x2Result();
@@ -2535,7 +2690,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       // GenerateIndirectRuntimeCall<FEXCore::VectorScalarF64Pair, FEXCore::VectorRegType, uint64_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillF64x2Result();
@@ -2566,7 +2721,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint32_t, uint64_t, uint64_t, FEXCore::VectorRegType, FEXCore::VectorRegType, uint16_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI32Result();
@@ -2589,7 +2744,7 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
     if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
       GenerateIndirectRuntimeCall<uint32_t, FEXCore::VectorRegType, FEXCore::VectorRegType, uint16_t>(FallbackPointerReg);
     } else {
-      blr(FallbackPointerReg);
+      CallHostFunction(FallbackPointerReg);
     }
 
     FillI32Result();
@@ -2609,6 +2764,8 @@ uint64_t Dispatcher::GenerateABICall(FallbackABI ABI) {
 }
 
 void Dispatcher::InitThreadPointers(FEXCore::Core::InternalThreadState* Thread) {
+  Thread->CurrentFrame->EnterCustomABI = EnterCustomABIAddress;
+  Thread->CurrentFrame->LeaveCustomABI = LeaveCustomABIAddress;
   // Setup dispatcher specific pointers that need to be accessed from JIT code
   {
     auto& Ptrs = Thread->CurrentFrame->Pointers;
@@ -2687,6 +2844,7 @@ SignalDelegatorConfig Dispatcher::MakeSignalDelegatorConfig() const {
 
     .SRAGPRMapping = GetSRAGPRMapping(),
     .SRAFPRMapping = GetSRAFPRMapping(),
+    .CallRetStackRegister = REG_CALLRET_SP.Idx(),
   };
 }
 

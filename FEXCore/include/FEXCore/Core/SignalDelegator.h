@@ -53,6 +53,10 @@ struct SignalDelegatorConfig {
   // SRA index mapping.
   SRAIndexMapping SRAGPRMapping;
   SRAIndexMapping SRAFPRMapping;
+
+  // Generated-code register holding the private call/return predictor stack.
+  // Embeddings must not infer this from the host operating system or ABI.
+  uint8_t CallRetStackRegister {0xff};
 };
 
 class SignalDelegator {

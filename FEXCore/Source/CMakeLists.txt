@@ -119,7 +119,7 @@ if (ENABLE_ZYDIS)
 endif()
 
 if (NOT MINGW)
-  list(APPEND LIBS dl)
+  list(APPEND LIBS ${CMAKE_DL_LIBS})
 else()
   list(APPEND LIBS synchronization)
   if (ARCHITECTURE_arm64ec)

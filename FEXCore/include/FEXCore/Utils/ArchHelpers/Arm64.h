@@ -16,6 +16,8 @@ enum class UnalignedHandlerType {
   HalfBarrier,
   ///< Backpatch unaligned access to non-atomic.
   NonAtomic,
+  ///< Only backpatch JIT TSO loads/stores; do not access guest memory or log.
+  HalfBarrierTSOOnly,
 };
 
 /**

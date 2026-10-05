@@ -57,7 +57,8 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
   } else if (OSABI == FEXCore::HLE::SyscallOSABI::OS_LINUX32) {
     NumArguments = GPRIndexes_32.size();
     GPRIndexes = &GPRIndexes_32;
-  } else if (OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC) {
+  } else if (OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC ||
+             OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC_STOP) {
     // All registers will be spilled before the syscall and filled afterwards so no JIT-side argument handling is necessary.
     NumArguments = 0;
     GPRIndexes = nullptr;
@@ -69,7 +70,10 @@ void OpDispatchBuilder::SyscallOp(OpcodeArgs, bool IsSyscallInst) {
   CalculateDeferredFlags();
 
   const auto GPRSize = GetGPROpSize();
-  auto NewRIP = GetRelocatedPC(Op, -Op->InstSize);
+  // An external Windows embedding resumes after SYSCALL/INT 2E, matching the
+  // architectural state observed by Wine's existing provider boundary.
+  auto NewRIP = GetRelocatedPC(
+    Op, OSABI == FEXCore::HLE::SyscallOSABI::OS_GENERIC_STOP ? 0 : -Op->InstSize);
   _StoreContextGPR(GPRSize, NewRIP, offsetof(FEXCore::Core::CPUState, rip));
 
   Ref Arguments[SyscallArgs] {
@@ -141,7 +145,10 @@ void OpDispatchBuilder::LEAOp(OpcodeArgs) {
     DstSize = OpAddr == X86Tables::DecodeFlags::FLAG_OPERAND_SIZE_LAST ? OpSize::i16Bit : OpSize::i32Bit;
   }
 
-  auto Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags, {.LoadData = false, .AllowUpperGarbage = SrcSize > DstSize});
+  auto Src = LoadSourceGPR_WithOpSize(Op, Op->Src[0], SrcSize, Op->Flags,
+                                    {.LoadData = false,
+                                     .AllowUpperGarbage = SrcSize > DstSize,
+                                     .EffectiveAddressSize = DstSize == OpSize::i32Bit ? OpSize::i32Bit : OpSize::iInvalid});
   StoreResultGPR_WithOpSize(Op, Op->Dest, Src, DstSize);
 }
 
@@ -4355,6 +4362,11 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
   } else if (Operand.IsRIPRelative() || Operand.IsRIPRelativeRelocation()) {
     if (Is64BitMode) {
       A.Base = GetRelocatedPC(Op, static_cast<int32_t>(Operand.Data.RIPLiteral.Value));
+      if (!A.Segment) {
+        A.StaticBaseLowBits =
+          (Op->PC + Op->InstSize + static_cast<int32_t>(Operand.Data.RIPLiteral.Value)) & 15;
+        A.HasStaticBaseLowBits = true;
+      }
     } else {
       // 32bit this isn't RIP relative but instead absolute
       if (Operand.IsRIPRelativeRelocation()) {
@@ -4408,7 +4420,7 @@ AddressMode OpDispatchBuilder::DecodeAddress(const X86Tables::DecodedOp& Op, con
 
 Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::DecodedOp& Op, const X86Tables::DecodedOperand& Operand,
                                              IR::OpSize OpSize, uint32_t Flags, const LoadSourceOptions& Options) {
-  auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage] = Options;
+  auto [Align, LoadData, ForceLoad, AccessType, AllowUpperGarbage, EffectiveAddressSize] = Options;
   AddressMode A = DecodeAddress(Op, Operand, AccessType, true /* IsLoad */);
 
   Ref Result {};
@@ -4456,7 +4468,8 @@ Ref OpDispatchBuilder::LoadSource_WithOpSize(RegClass Class, const X86Tables::De
       Result = _LoadMemAutoTSO(Class, OpSize, A, Align == OpSize::iInvalid ? OpSize : Align);
     }
   } else {
-    Result = LoadEffectiveAddress(this, A, GetGPROpSize(), false, AllowUpperGarbage);
+    Result = LoadEffectiveAddress(this, A, EffectiveAddressSize == OpSize::iInvalid ? GetGPROpSize() : EffectiveAddressSize, false,
+                                  AllowUpperGarbage);
   }
 
   if constexpr (Context::BLOCK_DEBUGGING) {

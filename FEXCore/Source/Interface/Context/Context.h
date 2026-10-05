@@ -139,6 +139,11 @@ class ContextImpl final : public FEXCore::Context::Context, public CPU::SharedCo
 public:
   // Context base class implementation.
   bool InitCore() override;
+  bool SetGuestMemoryMapping(uint64_t LowAddressLimit, uint64_t HostOffset) override;
+  bool SetCustomABITransition(void (*Transition)(bool)) override;
+  CustomDispatchEntry PrepareCustomDispatch(FEXCore::Core::InternalThreadState* Thread) override;
+  bool SetExternalExecutionStops(const uint64_t* TransitionBitmap, uint64_t HighestUserAddress,
+                                 uint32_t TransitionPageShift) override;
 
   void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) override;
 
@@ -149,6 +154,7 @@ public:
   void HandleCallback(FEXCore::Core::InternalThreadState* Thread, uint64_t RIP) override;
 
   bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) override;
+  bool IsHostAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) override;
   bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) override;
   uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) override;
 
@@ -348,6 +354,20 @@ public:
     // Used if the JIT needs to have its interrupt fault code emitted.
     bool NeedsPendingInterruptFaultCheck {false};
 
+    // Optional affine backing for guest addresses in [0, LowAddressLimit).
+    // The Switchyard Darwin provider uses this for Wine's 4-GiB low-VA
+    // shadow.  Guest architectural addresses remain canonical.
+    uint64_t GuestMemoryLowAddressLimit {};
+    uint64_t GuestMemoryHostOffset {};
+
+    // Optional embedding-owned return points.  These are immutable after
+    // InitCore so generated dispatcher code may embed their geometry.
+    bool ExternalStopsEnabled {};
+    const uint64_t* GuestTransitionBitmap {};
+    uint64_t GuestTransitionHighestAddress {};
+    uint32_t GuestTransitionPageShift {};
+    void (*CustomABITransition)(bool) {};
+
     FEX_CONFIG_OPT(Multiblock, MULTIBLOCK);
     FEX_CONFIG_OPT(SingleStepConfig, SINGLESTEP);
     FEX_CONFIG_OPT(GdbServer, GDBSERVER);
@@ -369,6 +389,23 @@ public:
     FEX_CONFIG_OPT(StrictInProcessSplitLocks, STRICTINPROCESSSPLITLOCKS);
     FEX_CONFIG_OPT(MonoHacks, MONOHACKS);
   } Config;
+
+  [[nodiscard]] uintptr_t TranslateGuestToHost(uint64_t GuestAddress) const {
+    if (GuestAddress < Config.GuestMemoryLowAddressLimit) {
+      return static_cast<uintptr_t>(GuestAddress + Config.GuestMemoryHostOffset);
+    }
+    return static_cast<uintptr_t>(GuestAddress);
+  }
+
+  [[nodiscard]] bool HasGuestMemoryMapping() const {
+    return Config.GuestMemoryLowAddressLimit != 0;
+  }
+
+  [[nodiscard]] bool HasGuestTransitionMap() const {
+    return Config.GuestTransitionBitmap != nullptr;
+  }
+
+  [[nodiscard]] bool IsGuestTransitionTarget(uint64_t GuestAddress) const;
 
   FEXCore::Utils::WritePriorityMutex::Mutex CodeInvalidationMutex {};
 

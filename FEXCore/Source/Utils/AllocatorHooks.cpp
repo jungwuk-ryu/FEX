@@ -11,15 +11,48 @@
 #endif
 
 #include <cstdint>
+#ifdef __APPLE__
+#include <malloc/malloc.h>
+#else
 #include <malloc.h>
+#endif
 #include <stdlib.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 
+#ifdef __APPLE__
+#include <pthread.h>
+#endif
+
 namespace FEXCore::Allocator {
 using mmap_hook_type = void* (*)(void* addr, size_t length, int prot, int flags, int fd, off_t offset);
 using munmap_hook_type = int (*)(void* addr, size_t length);
+
+#ifdef __APPLE__
+static thread_local uint32_t JITWriteDepth {};
+
+void BeginJITWrite() {
+  if (!pthread_jit_write_protect_supported_np()) {
+    ::abort();
+  }
+  if (JITWriteDepth++ == 0) {
+    pthread_jit_write_protect_np(0);
+  }
+}
+
+void EndJITWrite() {
+  if (JITWriteDepth == 0) {
+    ::abort();
+  }
+  if (--JITWriteDepth == 0) {
+    pthread_jit_write_protect_np(1);
+  }
+}
+#else
+void BeginJITWrite() {}
+void EndJITWrite() {}
+#endif
 
 #ifdef ENABLE_FEX_ALLOCATOR
 typedef void* (*rp_mmap_hook_type)(size_t size, size_t alignment, size_t* offset, size_t* mapped_size);
@@ -188,12 +221,25 @@ void* calloc(size_t n, size_t size) {
   return ::calloc(n, size);
 }
 void* memalign(size_t align, size_t s) {
+#ifdef __APPLE__
+  if (align < sizeof(void*)) {
+    align = sizeof(void*);
+  }
+  void* ptr {};
+  return ::posix_memalign(&ptr, align, s) ? nullptr : ptr;
+#else
   return ::memalign(align, s);
+#endif
 }
 void* valloc(size_t size) {
   return ::valloc(size);
 }
 int posix_memalign(void** r, size_t a, size_t s) {
+#ifdef __APPLE__
+  if (a < sizeof(void*)) {
+    a = sizeof(void*);
+  }
+#endif
   return ::posix_memalign(r, a, s);
 }
 void* realloc(void* ptr, size_t size) {
@@ -203,10 +249,22 @@ void free(void* ptr) {
   return ::free(ptr);
 }
 size_t malloc_usable_size(void* ptr) {
+#ifdef __APPLE__
+  return ::malloc_size(ptr);
+#else
   return ::malloc_usable_size(ptr);
+#endif
 }
 void* aligned_alloc(size_t a, size_t s) {
+#ifdef __APPLE__
+  if (a < sizeof(void*)) {
+    a = sizeof(void*);
+  }
+  void* ptr {};
+  return ::posix_memalign(&ptr, a, s) ? nullptr : ptr;
+#else
   return ::aligned_alloc(a, s);
+#endif
 }
 void aligned_free(void* ptr) {
   return ::free(ptr);

@@ -19,6 +19,12 @@ struct AddressMode {
   // Size in bytes for the address calculation. 8 for an arm64 hardware mode.
   IR::OpSize AddrSize;
   bool NonTSO;
+
+  // When true, StaticBaseLowBits contains the low four bits of the part of
+  // the effective address represented by Base.  Offset is intentionally not
+  // included so callers that split or adjust an access can retain the fact.
+  uint8_t StaticBaseLowBits;
+  bool HasStaticBaseLowBits;
 };
 
 Ref LoadEffectiveAddress(IREmitter* IREmit, const AddressMode& A, IR::OpSize GPRSize, bool AddSegmentBase, bool AllowUpperGarbage = false);

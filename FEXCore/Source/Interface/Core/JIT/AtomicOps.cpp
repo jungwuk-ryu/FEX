@@ -23,7 +23,7 @@ DEF_OP(CASPair) {
   auto MemSrc = GetReg(Op->Addr);
 
   const auto EmitSize = IROp->ElementSize == IR::OpSize::i64Bit ? ARMEmitter::Size::i64Bit : ARMEmitter::Size::i32Bit;
-  if (CTX->HostFeatures.SupportsAtomics) {
+  if (CTX->HostFeatures.SupportsAtomics && !CTX->HasGuestMemoryMapping()) {
     // RA has heuristics to try to pair sources, but we need to handle the cases
     // where they fail. We do so by moving to temporaries. Note we use 64-bit
     // moves here even for 32-bit cmpxchg, for the Firestorm register renamer.
@@ -52,6 +52,10 @@ DEF_OP(CASPair) {
       mov(ARMEmitter::Size::i64Bit, Dst1, CaspalDst1);
     }
   } else {
+    if (CTX->HasGuestMemoryMapping()) {
+      MemSrc = TranslateGuestAddress(MemSrc, TMP4, TMP2);
+    }
+
     // Save NZCV so we don't have to mark this op as clobbering NZCV (the
     // SupportsAtomics does not clobber atomics and this !SupportsAtomics path
     // is so slow it's not worth the complexity of splitting the IR op.). We
@@ -101,6 +105,7 @@ DEF_OP(CAS) {
   auto Desired = GetReg(Op->Desired);
   auto MemSrc = GetReg(Op->Addr);
   auto Dst = GetReg(Node);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     if (Expected == Dst && Dst != MemSrc && Dst != Desired) {
@@ -148,6 +153,7 @@ DEF_OP(AtomicSwap) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   const auto EmitSize = ConvertSize(IROp);
   const auto SubEmitSize = OpSize == IR::OpSize::i64Bit ? ARMEmitter::SubRegSize::i64Bit :
@@ -174,6 +180,7 @@ DEF_OP(AtomicFetchAdd) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     ldaddal(SubEmitSize, Src, GetReg(Node), MemSrc);
@@ -195,6 +202,7 @@ DEF_OP(AtomicFetchSub) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     neg(EmitSize, TMP2, Src);
@@ -217,6 +225,7 @@ DEF_OP(AtomicFetchAnd) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     mvn(EmitSize, TMP2, Src);
@@ -239,6 +248,7 @@ DEF_OP(AtomicFetchCLR) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     ldclral(SubEmitSize, Src, GetReg(Node), MemSrc);
@@ -260,6 +270,7 @@ DEF_OP(AtomicFetchOr) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     ldsetal(SubEmitSize, Src, GetReg(Node), MemSrc);
@@ -281,6 +292,7 @@ DEF_OP(AtomicFetchXor) {
 
   auto MemSrc = GetReg(Op->Addr);
   auto Src = GetReg(Op->Value);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     ldeoral(SubEmitSize, Src, GetReg(Node), MemSrc);
@@ -301,6 +313,7 @@ DEF_OP(AtomicFetchNeg) {
   const auto SubEmitSize = ConvertSubRegSize8(IROp->Size);
 
   auto MemSrc = GetReg(Op->Addr);
+  MemSrc = TranslateGuestAddress(MemSrc, TMP1, TMP2);
 
   if (CTX->HostFeatures.SupportsAtomics) {
     // Use a CAS loop to avoid needing to emulate unaligned LLSC atomics

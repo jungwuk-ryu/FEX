@@ -505,7 +505,9 @@ void OSAllocator_64Bit::AllocateMemoryRegions(fextl::vector<FEXCore::Allocator::
     mprotect(it.Ptr, ObjectAllocSize, PROT_READ | PROT_WRITE);
 
     // This enables the kernel to use transparent large pages in the allocator which can reduce memory pressure
+#ifndef __APPLE__
     ::madvise(it.Ptr, ObjectAllocSize, MADV_HUGEPAGE);
+#endif
 
     FEXCore::Allocator::VirtualName("FEXMem_Misc", reinterpret_cast<void*>(it.Ptr), ObjectAllocSize);
 

@@ -7,6 +7,8 @@
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
 
+#include <cerrno>
+
 #ifndef _WIN32
 #include <FEXCore/Utils/PrctlUtils.h>
 #endif
@@ -17,21 +19,29 @@ static constexpr size_t INITIAL_CODE_SIZE = 1024 * 1024 * 16;
 static constexpr size_t MAX_CODE_SIZE = 1024 * 1024 * 128;
 
 CodeBuffer::CodeBuffer(size_t Size)
-  : AllocatedSize(Size) {
-  Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(Size, true));
+  : AllocatedSize(AlignUp(Size, FEXCore::Allocator::GetHostPageSize()))
+  , GuardSize(FEXCore::Allocator::GetHostPageSize()) {
+  Ptr = static_cast<uint8_t*>(FEXCore::Allocator::VirtualAlloc(AllocatedSize, true));
   LOGMAN_THROW_A_FMT(!!Ptr, "Couldn't allocate code buffer");
 
   // Protect the last page of the allocated buffer to trigger SIGSEGV on write access
-  uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+  uintptr_t LastPageAddr = reinterpret_cast<uintptr_t>(Ptr) + UsableSize();
+#ifdef __APPLE__
+  // Darwin rejects subrange mprotect on MAP_JIT mappings.  Keep this complete
+  // host page outside the allocator's usable range; AtomicAllocateBuffer's
+  // checked upper bound remains the enforcement mechanism.
+  (void)LastPageAddr;
+#else
+  if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), GuardSize,
                                           FEXCore::Allocator::ProtectOptions::None)) {
-    LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+    LogMan::Msg::EFmt("Failed to mprotect shared code-buffer guard page: {}", errno);
   }
+#endif
 
-  FEXCore::Allocator::VirtualName("FEXMemJIT", Ptr, Size);
+  FEXCore::Allocator::VirtualName("FEXMemJIT", Ptr, AllocatedSize);
 
   // Huge-pages reduce the amount of iTLB misses dramatically when it works.
-  FEXCore::Allocator::VirtualTHPControl(Ptr, Size, FEXCore::Allocator::THPControl::Enable);
+  FEXCore::Allocator::VirtualTHPControl(Ptr, AllocatedSize, FEXCore::Allocator::THPControl::Enable);
 
   LookupCache = fextl::make_unique<GuestToHostMap>();
 
@@ -60,7 +70,11 @@ fextl::shared_ptr<CodeBuffer> SharedCodeBufferManager::AllocateNew(size_t Size) 
   // -1: The kernel doesn't support MDWE
   // 0: MDWE is supported but disabled
   // >0: MDWE is enabled, hence prohibiting RWX mappings
+#ifdef __APPLE__
+  int MDWE = -1;
+#else
   int MDWE = ::prctl(PR_GET_MDWE, 0, 0, 0, 0);
+#endif
   if (MDWE != -1 && MDWE != 0) {
     LogMan::Msg::EFmt("MDWE was set to 0x{:x} which means FEX can't allocate executable memory", MDWE);
   }

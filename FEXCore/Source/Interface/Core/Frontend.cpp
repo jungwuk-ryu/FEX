@@ -129,9 +129,14 @@ uint8_t Decoder::ReadByte() {
 }
 
 std::optional<uint8_t> Decoder::PeekByte(uint8_t Offset) {
-  uint64_t ByteAddress = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize + Offset);
+  const uint64_t StreamAddress = InstStream.GuestAddress;
+  const uint64_t ByteAddress = StreamAddress + InstructionSize + Offset;
   if (CheckRangeExecutable(ByteAddress, 1)) {
-    return InstStream.AdjustedInstStream[InstructionSize + Offset];
+    const auto NormalStream = CTX->TranslateGuestToHost(StreamAddress);
+    if (InstStream.HostAddress == NormalStream) {
+      return *reinterpret_cast<const uint8_t*>(CTX->TranslateGuestToHost(ByteAddress));
+    }
+    return *reinterpret_cast<const uint8_t*>(InstStream.HostAddress + InstructionSize + Offset);
   } else {
     return std::nullopt;
   }
@@ -141,9 +146,18 @@ std::pair<uint64_t, bool> Decoder::ReadData(uint8_t Size) {
   LOGMAN_THROW_A_FMT(Size != 0 && Size <= sizeof(uint64_t), "Unknown data size to read");
 
   uint64_t Res = 0;
-  uint64_t Address = reinterpret_cast<uint64_t>(InstStream.InstStream + InstructionSize);
+  const uint64_t StreamAddress = InstStream.GuestAddress;
+  const uint64_t Address = StreamAddress + InstructionSize;
   if (CheckRangeExecutable(Address, Size)) {
-    std::memcpy(&Res, &InstStream.AdjustedInstStream[InstructionSize], Size);
+    const auto NormalStream = CTX->TranslateGuestToHost(StreamAddress);
+    if (InstStream.HostAddress == NormalStream) {
+      auto* Bytes = reinterpret_cast<uint8_t*>(&Res);
+      for (uint8_t i = 0; i < Size; ++i) {
+        Bytes[i] = *reinterpret_cast<const uint8_t*>(CTX->TranslateGuestToHost(Address + i));
+      }
+    } else {
+      std::memcpy(&Res, reinterpret_cast<const void*>(InstStream.HostAddress + InstructionSize), Size);
+    }
   } else {
     HitNonExecutableRange = true;
     // See PeekByte, this specific case may cause some executable memory to read as 0 but it doesn't matter as the entire instruction will be rolled back anyway.
@@ -1357,7 +1371,11 @@ void Decoder::AddBranchTarget(uint64_t Target) {
 const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _InstStream, uint64_t EntryPoint, uint64_t RIP) {
   constexpr uint64_t VSyscall_Base = 0xFFFF'FFFF'FF60'0000ULL;
   constexpr uint64_t VSyscall_End = VSyscall_Base + 0x1000;
-
+  (void)_InstStream;
+  (void)EntryPoint;
+  // Keep the guest address used by executable-range and relocation logic
+  // separate from the host pointer used to read bytes.  A low guest address
+  // may be backed in Wine's high shadow and is not a C++ pointer itself.
   if (OSABI == FEXCore::HLE::SyscallOSABI::OS_LINUX64 && RIP >= VSyscall_Base && RIP < VSyscall_End) {
     // VSyscall
     // This doesn't exist on AArch64 and on x86_64 hosts this is emulated with faults to a region mapped with --xp permissions
@@ -1366,14 +1384,14 @@ const Decoder::DecodeStream Decoder::AdjustAddrForSpecialRegion(const uint8_t* _
     // Offset 0x800: vgetcpu
     uint64_t Offset = RIP - VSyscall_Base;
     return DecodeStream {
-      .InstStream = _InstStream - EntryPoint + RIP,
-      .AdjustedInstStream = VSyscallData + Offset,
+      .GuestAddress = RIP,
+      .HostAddress = reinterpret_cast<uintptr_t>(VSyscallData + Offset),
     };
   }
 
   return DecodeStream {
-    .InstStream = _InstStream - EntryPoint + RIP,
-    .AdjustedInstStream = _InstStream - EntryPoint + RIP,
+    .GuestAddress = RIP,
+    .HostAddress = CTX->TranslateGuestToHost(RIP),
   };
 }
 

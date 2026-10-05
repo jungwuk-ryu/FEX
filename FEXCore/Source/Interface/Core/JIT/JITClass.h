@@ -93,10 +93,17 @@ private:
   CPUBackend::CompiledCode CodeData {};
 
   fextl::vector<ARMEmitter::BiDirectionalLabel> JumpTargets;
+  fextl::vector<uint64_t> JumpTargetRIPs;
 
   ARMEmitter::BiDirectionalLabel* JumpTarget(IR::OrderedNodeWrapper Node) {
     auto Block = IR->GetOp<IR::IROp_CodeBlock>(Node);
     return &JumpTargets[Block->ID];
+  }
+
+  uint64_t GuestRIPForJumpTarget(const ARMEmitter::BiDirectionalLabel* Target) const {
+    const auto Index = static_cast<size_t>(Target - JumpTargets.data());
+    LOGMAN_THROW_A_FMT(Index < JumpTargetRIPs.size(), "Jump target is outside the current function");
+    return JumpTargetRIPs[Index];
   }
 
   fextl::map<IR::NodeID, ARMEmitter::BiDirectionalLabel> CallReturnTargets;
@@ -325,6 +332,16 @@ private:
   [[nodiscard]]
   ARMEmitter::Register ApplyMemOperand(IR::OpSize AccessSize, ARMEmitter::Register Base, ARMEmitter::Register Tmp,
                                        IR::OrderedNodeWrapper Offset, IR::MemOffsetType OffsetType, uint8_t OffsetScale);
+  ARMEmitter::Register TranslateGuestAddress(ARMEmitter::Register Guest, ARMEmitter::Register Host,
+                                             ARMEmitter::Register Scratch);
+  ARMEmitter::Register TranslateGuestAddressWithOffset(ARMEmitter::Register GuestBase, int64_t GuestOffset,
+                                                       ARMEmitter::Register Host, ARMEmitter::Register Scratch);
+
+  // Compile-time dataflow fact, not a cache of memory contents or permissions.
+  // TMP2 holds this base's translated address only across audited FPR-only IR.
+  std::optional<ARMEmitter::Register> ReusableMappedBase;
+  bool MayRememberMappedBase {};
+  void PrepareMappedAddressReuse(const IR::IROp_Header* IROp);
 
   // NOTE: Will use TMP1 as a way to encode immediates that happen to fall outside
   //       the limits of the scalar plus immediate variant of SVE load/stores.
@@ -623,9 +640,9 @@ private:
 
   void EmitTFCheck();
 
-  void EmitSuspendInterruptCheck();
+  void EmitSuspendInterruptCheck(uint64_t GuestRIP);
 
-  void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF);
+  void EmitEntryPoint(ARMEmitter::BackwardLabel& HeaderLabel, bool CheckTF, uint64_t GuestRIP);
 
   [[nodiscard]] CodeBuffer::CodeBufferAllocation AllocateCodeBufferInSharedCache(size_t Size);
 

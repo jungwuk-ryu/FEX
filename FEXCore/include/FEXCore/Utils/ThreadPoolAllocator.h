@@ -1,6 +1,8 @@
 // SPDX-License-Identifier: MIT
 #pragma once
 
+#include <cerrno>
+
 #include <FEXCore/Utils/Allocator.h>
 #include <FEXCore/Utils/LogManager.h>
 #include <FEXCore/Utils/MathUtils.h>
@@ -417,10 +419,11 @@ public:
 private:
   void* Alloc(size_t Size) override {
     auto Ptr = FEXCore::Allocator::VirtualAlloc(Size);
-    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, FEXCore::Utils::FEX_PAGE_SIZE);
-    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), FEXCore::Utils::FEX_PAGE_SIZE,
+    const size_t GuardSize = FEXCore::Allocator::GetHostPageSize();
+    uintptr_t LastPageAddr = AlignDown(reinterpret_cast<uintptr_t>(Ptr) + Size - 1, GuardSize);
+    if (!FEXCore::Allocator::VirtualProtect(reinterpret_cast<void*>(LastPageAddr), GuardSize,
                                             FEXCore::Allocator::ProtectOptions::None)) {
-      LogMan::Msg::EFmt("Failed to mprotect last page of code buffer.");
+      LogMan::Msg::EFmt("Failed to mprotect temporary code-buffer guard page: {}", errno);
     }
     if (Name) {
       FEXCore::Allocator::VirtualName(Name, Ptr, Size);

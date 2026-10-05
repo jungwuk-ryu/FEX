@@ -5,7 +5,7 @@ tags: backend|arm64
 $end_info$
 */
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
 #include <syscall.h>
 #endif
 
@@ -203,7 +203,7 @@ DEF_OP(Print) {
       GenerateIndirectRuntimeCall<void, uint64_t, uint64_t>(ARMEmitter::Reg::r3);
     }
   } else {
-    blr(ARMEmitter::Reg::r3);
+    CallHostFunction(ARMEmitter::Reg::r3);
   }
 
   FillStaticRegs();
@@ -222,7 +222,7 @@ DEF_OP(PrintMsg) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<void, uint64_t>(ARMEmitter::Reg::r1);
   } else {
-    blr(ARMEmitter::Reg::r1);
+    CallHostFunction(ARMEmitter::Reg::r1);
   }
 
   FillStaticRegs();
@@ -234,11 +234,13 @@ DEF_OP(ProcessorID) {
     mrs(GetReg(Node), ARMEmitter::SystemRegister::TPIDRRO_EL0);
     return;
   }
-#ifdef _WIN32
+#if defined(_WIN32)
   else {
     // If on Windows and TPIDRRO isn't supported (like in wine), then this is a programming error.
     ERROR_AND_DIE_FMT("Unsupported");
   }
+#elif defined(__APPLE__)
+  mov(ARMEmitter::Size::i64Bit, GetReg(Node), ARMEmitter::Reg::zr);
 #else
   // We always need to spill x8 since we can't know if it is live at this SSA location
   uint32_t SpillMask = 1U << 8;
@@ -343,7 +345,7 @@ DEF_OP(MonoBackpatcherWrite) {
   if (!CTX->Config.DisableVixlIndirectCalls) [[unlikely]] {
     GenerateIndirectRuntimeCall<void, void*, uint8_t, uint64_t, uint64_t>(ARMEmitter::Reg::r4);
   } else {
-    blr(ARMEmitter::Reg::r4);
+    CallHostFunction(ARMEmitter::Reg::r4);
   }
 
 #ifdef ARCHITECTURE_arm64ec

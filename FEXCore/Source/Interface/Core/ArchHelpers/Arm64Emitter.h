@@ -32,7 +32,9 @@ namespace FEXCore::CPU {
 // Contains the address to the currently available CPU state
 constexpr auto STATE = ARMEmitter::XReg::x28;
 
-#ifndef ARCHITECTURE_arm64ec
+// Register placement is independent of the C++ host ABI. The downstream
+// Darwin experiment does not enable Windows dispatcher, TEB or signal code.
+#if !defined(ARCHITECTURE_arm64ec) && !defined(FEXCORE_ARM64EC_REGISTER_ABI)
 // GPR temporaries. Only x3 can be used across spill boundaries
 // so if these ever need to change, be very careful about that.
 constexpr auto TMP1 = ARMEmitter::XReg::x0;
@@ -119,6 +121,12 @@ public:
   };
   void LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, uint64_t Constant, PadType Pad = PadType::NOPAD, int MaxBytes = 0);
 
+  // Host calls only: generated helpers keep using blr. These audited calls use
+  // register arguments, including x8 for indirect results; no stack arguments.
+  void CallHostFunction(ARMEmitter::Register Function);
+  void EnterCustomABI();
+  void LeaveCustomABI();
+
 protected:
   FEXCore::Context::ContextImpl* EmitterCTX;
 
@@ -197,8 +205,9 @@ protected:
   size_t PushDynamicRegs(ARMEmitter::Register TmpReg);
   void PopDynamicRegs();
 
-  void PushCalleeSavedRegisters();
+  void PushCalleeSavedRegisters(bool CustomCaller = false);
   void PopCalleeSavedRegisters();
+  void LeaveCustomABIForCaller();
 
   // Spills and fills SRA/Dynamic registers that are required for Arm64 `preserve_all` ABI.
   // This ABI changes most registers to be callee saved.

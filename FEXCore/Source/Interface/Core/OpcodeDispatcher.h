@@ -112,6 +112,10 @@ struct LoadSourceOptions {
   // or 56 bits depending on the operating mode).
   // If true, no zero-extension occurs.
   bool AllowUpperGarbage = false;
+
+  // Arithmetic width for an address value, never for a memory access.
+  // iInvalid preserves the current execution mode's GPR width.
+  IR::OpSize EffectiveAddressSize = OpSize::iInvalid;
 };
 
 struct DispatchTableEntry {
@@ -2444,7 +2448,7 @@ private:
 
   Ref _StoreMemAutoTSO(RegClass Class, OpSize Size, Ref Addr, Ref Value, OpSize Align = OpSize::i8Bit) {
     if (IsTSOEnabled(Class)) {
-      return _StoreMemTSO(Class, Size, Value, Addr, Invalid(), Align, MemOffsetType::SXTX, 1);
+      return _StoreMemTSO(Class, Size, Value, Addr, Invalid(), Align, MemOffsetType::SXTX, 1, false);
     } else {
       return _StoreMem(Class, Size, Value, Addr, Invalid(), Align, MemOffsetType::SXTX, 1);
     }
@@ -2538,7 +2542,12 @@ private:
     const auto B = SelectAddressMode(this, A, GetGPROpSize(), CTX->HostFeatures.SupportsTSOImm9, AtomicTSO, Class != RegClass::GPR, Size);
 
     if (AtomicTSO) {
-      return _StoreMemTSO(Class, Size, Value, B.Base, B.Index, Align, B.IndexType, B.IndexScale);
+      const auto StoreSize = IR::OpSizeToSize(Size);
+      const bool NeedsUnalignedHalfBarrier =
+        A.HasStaticBaseLowBits && StoreSize > 1 &&
+        (((A.StaticBaseLowBits + static_cast<uint64_t>(A.Offset)) & 15) + StoreSize > 16);
+      return _StoreMemTSO(Class, Size, Value, B.Base, B.Index, Align, B.IndexType, B.IndexScale,
+                          NeedsUnalignedHalfBarrier);
     } else {
       return _StoreMem(Class, Size, Value, B.Base, B.Index, Align, B.IndexType, B.IndexScale);
     }

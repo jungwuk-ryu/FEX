@@ -22,6 +22,7 @@ class ThunkHandler;
 
 namespace FEXCore::Core {
 struct CPUState;
+struct CpuStateFrame;
 struct InternalThreadState;
 } // namespace FEXCore::Core
 
@@ -46,6 +47,10 @@ using CustomIREntrypointHandler = std::function<void(uintptr_t Entrypoint, IR::I
 
 using ExitHandler = std::function<void(Core::InternalThreadState* Thread)>;
 
+// Private Darwin embedding entry: AAPCS register arguments with custom x18
+// already active on both entry and return. Never call this as a Mach-O C API.
+using CustomDispatchEntry = void (*)(Core::CpuStateFrame* Frame);
+
 class Context {
 public:
   virtual ~Context() = default;
@@ -69,6 +74,51 @@ public:
   FEX_DEFAULT_VISIBILITY virtual bool InitCore() = 0;
 
   /**
+   * @brief Configure a uniform low guest-address mapping before InitCore.
+   *
+   * Guest addresses below LowAddressLimit are backed at HostOffset + guest;
+   * all other guest addresses remain identity mapped.  Passing two zeroes
+   * disables the mapping. The Darwin embedding's generated transform requires
+   * LowAddressLimit == 4 GiB; implementations reject other nonzero limits,
+   * non-power-of-two host offsets and arithmetic overflow.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool SetGuestMemoryMapping(uint64_t LowAddressLimit, uint64_t HostOffset) = 0;
+
+  /**
+   * @brief Enable an embedding-owned execution-stop contract before InitCore.
+   *
+   * The optional transition bitmap contains one bit per guest page.  A set bit
+   * makes the dispatcher return before decoding or executing that page.  Three
+   * zero arguments enable syscall, guest-exception, and per-thread suspend
+   * stops without a transition bitmap.
+   */
+  FEX_DEFAULT_VISIBILITY virtual bool SetExternalExecutionStops(
+    const uint64_t* TransitionBitmap, uint64_t HighestUserAddress, uint32_t TransitionPageShift) = 0;
+
+  /** Optional Darwin embedding contract, immutable after InitCore. The callback
+   * selects custom/system x18 mode using the operating system, preserves the
+   * normal host ABI, and must not throw or call other OS services in custom mode.
+   * The embedding owns signal/nonlocal-exit handling and supplies each frame's
+   * authenticated, nonzero CustomABIValue before execution, without concurrent
+   * mutation. External stops must be configured;
+   * ExecuteThread/HandleCallback reject an unset value without entering JIT and
+   * report InvalidCustomABI through ExternalStop. A null callback retains
+   * ordinary host mode. */
+  FEX_DEFAULT_VISIBILITY virtual bool SetCustomABITransition(void (*Transition)(bool)) = 0;
+
+  /** Prepare a resource-free generated entry for an already-custom caller.
+   * Returns null unless the custom-ABI/external-stop contract is configured
+   * and this thread has a nonzero embedding-authenticated CustomABIValue.
+   * Call in system mode before dispatch. The caller must exclusively own the
+   * thread and pin context, mappings and code until the generated entry returns
+   * or its execution is explicitly consumed by fault reconstruction. No FEX
+   * execute/compiler activation may survive on the private stack during a
+   * native interval. Reacquire ownership and use this
+   * immutable dispatcher entry, not a TB address, on every fresh execution. */
+  FEX_DEFAULT_VISIBILITY virtual CustomDispatchEntry PrepareCustomDispatch(
+    FEXCore::Core::InternalThreadState* Thread) = 0;
+
+  /**
    * @brief Executes the supplied thread context on the current thread until a return is requested
    */
   FEX_DEFAULT_VISIBILITY virtual void ExecuteThread(FEXCore::Core::InternalThreadState* Thread) = 0;
@@ -80,6 +130,7 @@ public:
   FEX_DEFAULT_VISIBILITY virtual void HandleCallback(FEXCore::Core::InternalThreadState* Thread, uint64_t RIP) = 0;
 
   FEX_DEFAULT_VISIBILITY virtual bool IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) = 0;
+  FEX_DEFAULT_VISIBILITY virtual bool IsHostAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) = 0;
   FEX_DEFAULT_VISIBILITY virtual bool IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) = 0;
   FEX_DEFAULT_VISIBILITY virtual uint64_t GetGuestBlockEntry(FEXCore::Core::InternalThreadState* Thread) = 0;
 

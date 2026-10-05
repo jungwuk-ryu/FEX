@@ -59,6 +59,7 @@ $end_info$
 
 #include <algorithm>
 #include <array>
+#include <bit>
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
@@ -78,6 +79,82 @@ $end_info$
 #include <xxhash.h>
 
 namespace FEXCore::Context {
+
+bool ContextImpl::SetGuestMemoryMapping(uint64_t LowAddressLimit, uint64_t HostOffset) {
+  if (Dispatcher) {
+    return false;
+  }
+  if (LowAddressLimit == 0 || HostOffset == 0) {
+    if (LowAddressLimit != 0 || HostOffset != 0) {
+      return false;
+    }
+    Config.GuestMemoryLowAddressLimit = 0;
+    Config.GuestMemoryHostOffset = 0;
+    return true;
+  }
+  // The generated CLZ/bit-5 transform is specialized for Wine's 4-GiB domain.
+  // Other powers of two cannot use it; reject before publishing geometry.
+  if (LowAddressLimit != (uint64_t {1} << 32) ||
+      !std::has_single_bit(HostOffset) ||
+      HostOffset > UINT64_MAX - LowAddressLimit ||
+      HostOffset < LowAddressLimit) {
+    return false;
+  }
+  Config.GuestMemoryLowAddressLimit = LowAddressLimit;
+  Config.GuestMemoryHostOffset = HostOffset;
+  return true;
+}
+
+bool ContextImpl::SetExternalExecutionStops(const uint64_t* TransitionBitmap, uint64_t HighestUserAddress,
+                                            uint32_t TransitionPageShift) {
+  if (Dispatcher) {
+    return false;
+  }
+  if (!TransitionBitmap) {
+    if (HighestUserAddress != 0 || TransitionPageShift != 0) {
+      return false;
+    }
+  } else {
+    if ((reinterpret_cast<uintptr_t>(TransitionBitmap) & (alignof(uint64_t) - 1)) != 0 ||
+        HighestUserAddress == 0 || TransitionPageShift < 12 || TransitionPageShift > 16) {
+      return false;
+    }
+    const uint64_t LastWord = (HighestUserAddress >> TransitionPageShift) >> 6;
+    if (LastWord > (UINTPTR_MAX - reinterpret_cast<uintptr_t>(TransitionBitmap)) / sizeof(uint64_t)) {
+      return false;
+    }
+  }
+  Config.ExternalStopsEnabled = true;
+  Config.GuestTransitionBitmap = TransitionBitmap;
+  Config.GuestTransitionHighestAddress = HighestUserAddress;
+  Config.GuestTransitionPageShift = TransitionPageShift;
+  return true;
+}
+
+bool ContextImpl::SetCustomABITransition(void (*Transition)(bool)) {
+  if (Dispatcher) return false;
+  if (Transition) {
+#if !defined(__APPLE__) || defined(ARCHITECTURE_arm64ec) || defined(VIXL_SIMULATOR)
+    return false;
+#else
+    // The bridge preserves NEON, not SVE state, and embeds process-owned
+    // callback addresses. Neither simulator nor serialized code may use it.
+    if (!Config.ExternalStopsEnabled || HostFeatures.SupportsSVE() || !Config.DisableVixlIndirectCalls() ||
+        CodeCache.EnableCodeCaching()) return false;
+#endif
+  }
+  Config.CustomABITransition = Transition;
+  return true;
+}
+
+bool ContextImpl::IsGuestTransitionTarget(uint64_t GuestAddress) const {
+  if (!Config.GuestTransitionBitmap || GuestAddress > Config.GuestTransitionHighestAddress) {
+    return false;
+  }
+  const uint64_t Page = GuestAddress >> Config.GuestTransitionPageShift;
+  const uint64_t Word = __atomic_load_n(&Config.GuestTransitionBitmap[Page >> 6], __ATOMIC_ACQUIRE);
+  return ((Word >> (Page & 63)) & 1) != 0;
+}
 ContextImpl::ContextImpl(const FEXCore::HostFeatures& Features)
   : HostFeatures {Features}
   , CPUID {this}
@@ -126,6 +203,28 @@ static GetFrameBlockInfoResult GetFrameBlockInfo(FEXCore::Core::CpuStateFrame* F
 bool ContextImpl::IsAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) {
   auto [_, InlineTail] = GetFrameBlockInfo(Thread->CurrentFrame);
   return InlineTail && (Address + Size > InlineTail->RIP && Address < InlineTail->RIP + InlineTail->GuestSize);
+}
+
+bool ContextImpl::IsHostAddressInCurrentBlock(FEXCore::Core::InternalThreadState* Thread, uint64_t Address, uint64_t Size) {
+  using Header = CPU::CPUBackend::JITCodeHeader;
+  using Tail = CPU::CPUBackend::JITCodeTail;
+  const uint64_t BlockBegin = Thread->CurrentFrame->State.InlineJITBlockHeader;
+  if (!Size || !BlockBegin || BlockBegin > UINT64_MAX - sizeof(Header) ||
+      !IsAddressInCodeBuffer(Thread, BlockBegin) ||
+      !IsAddressInCodeBuffer(Thread, BlockBegin + sizeof(Header) - 1)) {
+    return false;
+  }
+  const auto* InlineHeader = reinterpret_cast<const Header*>(BlockBegin);
+  const uint64_t TailOffset = InlineHeader->OffsetToBlockTail;
+  if (TailOffset < sizeof(Header) || TailOffset > UINT64_MAX - sizeof(Tail) ||
+      BlockBegin > UINT64_MAX - TailOffset - sizeof(Tail) ||
+      !IsAddressInCodeBuffer(Thread, BlockBegin + TailOffset) ||
+      !IsAddressInCodeBuffer(Thread, BlockBegin + TailOffset + sizeof(Tail) - 1) ||
+      Address < BlockBegin + sizeof(Header)) {
+    return false;
+  }
+  const uint64_t Offset = Address - BlockBegin;
+  return Offset < TailOffset && Size <= TailOffset - Offset;
 }
 
 bool ContextImpl::IsCurrentBlockSingleInst(FEXCore::Core::InternalThreadState* Thread) {
@@ -303,6 +402,14 @@ void ContextImpl::SetXMMRegistersFromState(FEXCore::Core::InternalThreadState* T
 
 void ContextImpl::SetFlagsFromCompactedEFLAGS(FEXCore::Core::InternalThreadState* Thread, uint32_t EFLAGS) {
   const auto Frame = Thread->CurrentFrame;
+  // This fixed-size conversion runs at every external CPU-state import. Expose
+  // constant bit positions to the optimizer instead of dispatching the switch
+  // 32 times, while preserving the lazy PF/AF and packed NZCV representation.
+#if defined(__clang__)
+#pragma clang loop unroll(full)
+#elif defined(__GNUC__)
+#pragma GCC unroll 32
+#endif
   for (size_t i = 0; i < FEXCore::Core::CPUState::NUM_EFLAG_BITS; ++i) {
     switch (i) {
     case X86State::RFLAG_OF_RAW_LOC:
@@ -379,10 +486,18 @@ bool ContextImpl::InitCore() {
 }
 
 void ContextImpl::HandleCallback(FEXCore::Core::InternalThreadState* Thread, uint64_t RIP) {
+  if (Config.CustomABITransition && !Thread->CurrentFrame->CustomABIValue) {
+    Thread->CurrentFrame->ExternalStop = FEXCore::Core::ExternalStopReason::InvalidCustomABI;
+    return;
+  }
   static_cast<ContextImpl*>(Thread->CTX)->Dispatcher->ExecuteJITCallback(Thread->CurrentFrame, RIP);
 }
 
 void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
+  if (Config.CustomABITransition && !Thread->CurrentFrame->CustomABIValue) {
+    Thread->CurrentFrame->ExternalStop = FEXCore::Core::ExternalStopReason::InvalidCustomABI;
+    return;
+  }
   // Update the thread pointer for Thunk return to the latest.
   Thread->CurrentFrame->Pointers.ThunkCallbackRet = SignalDelegation->GetThunkCallbackRET();
 
@@ -390,6 +505,13 @@ void ContextImpl::ExecuteThread(FEXCore::Core::InternalThreadState* Thread) {
 
   // If it is the parent thread that died then just leave
   // TODO: This doesn't make sense when the parent thread doesn't outlive its children
+}
+
+CustomDispatchEntry ContextImpl::PrepareCustomDispatch(FEXCore::Core::InternalThreadState* Thread) {
+  if (!Dispatcher || !Config.CustomABITransition || !Thread || Thread->CTX != this ||
+      !Thread->CurrentFrame || !Thread->CurrentFrame->CustomABIValue) return nullptr;
+  Thread->CurrentFrame->Pointers.ThunkCallbackRet = SignalDelegation->GetThunkCallbackRET();
+  return Dispatcher->GetCustomDispatchEntry();
 }
 
 void ContextImpl::InitializeCompiler(FEXCore::Core::InternalThreadState* Thread) {
@@ -511,7 +633,8 @@ static void IRDumper(FEXCore::Core::InternalThreadState* Thread, IR::IREmitter* 
 }
 
 bool ContextImpl::CheckIfBlockIsCacheable(FEXCore::Core::InternalThreadState& Thread, uint64_t GuestRIP, uint64_t MaxInst) {
-  return Thread.FrontendDecoder->CheckIfCacheable(Thread, reinterpret_cast<const uint8_t*>(GuestRIP), GuestRIP, MaxInst);
+  return Thread.FrontendDecoder->CheckIfCacheable(
+    Thread, reinterpret_cast<const uint8_t*>(TranslateGuestToHost(GuestRIP)), GuestRIP, MaxInst);
 }
 
 ContextImpl::GenerateIRResult
@@ -537,7 +660,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
   }
 
   if (!HasCustomIR) {
-    const auto* GuestCode = reinterpret_cast<const uint8_t*>(GuestRIP);
+    const auto* GuestCode = reinterpret_cast<const uint8_t*>(TranslateGuestToHost(GuestRIP));
 
     Thread->FrontendDecoder->DecodeInstructionsAtEntry(Thread, GuestCode, GuestRIP, MaxInst);
 
@@ -605,7 +728,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
 
 #ifdef ZYDIS_DISASSEMBLER
         if (FEXCore::Config::Get_X86DISASSEMBLE()) {
-          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(InstAddress);
+          const uint8_t* InstBytes = reinterpret_cast<const uint8_t*>(TranslateGuestToHost(InstAddress));
           ZydisDisassembledInstruction ZydisInst;
           if (ZYAN_SUCCESS(ZydisDisassembleIntel(ZydisMachineMode, InstAddress, InstBytes, DecodedInfo->InstSize, &ZydisInst))) {
             LogMan::Msg::IFmt("    {:#x}: {}", InstAddress, ZydisInst.text);
@@ -636,7 +759,7 @@ ContextImpl::GenerateIR(FEXCore::Core::InternalThreadState* Thread, uint64_t Gue
         }
 
         if (Config.SMCChecks == FEXCore::Config::CONFIG_SMC_FULL || Block.ForceFullSMCDetection) {
-          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(Block.Entry + BlockInstructionsLength);
+          auto ExistingCodePtr = reinterpret_cast<uint8_t*>(TranslateGuestToHost(Block.Entry + BlockInstructionsLength));
           auto InstAddressReg = Thread->OpDispatcher->_EntrypointOffset(GPRSize, InstAddress - GuestRIP);
           std::array<uint8_t, 0x10> CodeOriginal;
           memcpy(CodeOriginal.data(), ExistingCodePtr, DecodedInfo->InstSize);
@@ -830,6 +953,7 @@ ContextImpl::CompileCodeResult ContextImpl::CompileCode(FEXCore::Core::InternalT
 }
 
 uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP, uint64_t MaxInst) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   if constexpr (BLOCK_DEBUGGING) {
     // Block debugging logic is hand-written and needs to be handled with care.
     // Force MaxInst to only be one in this case.
@@ -972,7 +1096,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
     if (DebugData && DebugData->Relocations) {
       Relocations = *DebugData->Relocations;
     }
-    std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(StartAddr), Length};
+    std::span<const uint8_t> GuestCode = {reinterpret_cast<const uint8_t*>(TranslateGuestToHost(StartAddr)), Length};
     const Frontend::Decoder::DecodedBlockInformation* BlockInfo = NeedsAddGuestCodeRanges ? Thread->FrontendDecoder->GetDecodedBlockInfo() : nullptr;
     DiskCache.Store(Thread, *Region, GuestRIP, GuestCode, CompiledCode, Relocations, BlockInfo);
 
@@ -995,6 +1119,7 @@ uintptr_t ContextImpl::CompileBlock(FEXCore::Core::CpuStateFrame* Frame, uint64_
 }
 
 uintptr_t ContextImpl::CompileSingleStep(FEXCore::Core::CpuStateFrame* Frame, uint64_t GuestRIP) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   FEXCORE_PROFILE_SCOPED("CompileSingleStep");
   auto Thread = Frame->Thread;
 
@@ -1141,13 +1266,14 @@ void ContextImpl::RemoveCustomIREntrypoint(FEXCore::Core::InternalThreadState* T
 void ContextImpl::MonoBackpatcherWrite(FEXCore::Core::CpuStateFrame* Frame, uint8_t Size, uint64_t Address, uint64_t Value) {
   auto Thread = Frame->Thread;
   auto CTX = static_cast<ContextImpl*>(Thread->CTX);
+  auto HostAddress = CTX->TranslateGuestToHost(Address);
   {
     auto lk = GuardSignalDeferringSection(CTX->CodeInvalidationMutex, Thread);
 
     if (Size == 8) {
-      *reinterpret_cast<uint64_t*>(Address) = Value;
+      *reinterpret_cast<uint64_t*>(HostAddress) = Value;
     } else if (Size == 4) {
-      *reinterpret_cast<uint32_t*>(Address) = Value;
+      *reinterpret_cast<uint32_t*>(HostAddress) = Value;
     } else {
       ERROR_AND_DIE_FMT("Unexpected write size for backpatcher: {}", Size);
     }

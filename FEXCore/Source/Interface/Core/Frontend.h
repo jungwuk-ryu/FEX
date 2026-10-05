@@ -130,20 +130,20 @@ private:
 
   struct DecodeStream {
     // Original instruction stream RIP location.
-    const uint8_t* InstStream;
+    uint64_t GuestAddress;
 
     // Adjusted location for FEX actually decodes from.
-    const uint8_t* AdjustedInstStream;
+    uintptr_t HostAddress;
 
     DecodeStream& operator-=(size_t offset) noexcept {
-      InstStream -= offset;
-      AdjustedInstStream -= offset;
+      GuestAddress -= offset;
+      HostAddress -= offset;
       return *this;
     }
 
     DecodeStream& operator+=(size_t offset) noexcept {
-      InstStream += offset;
-      AdjustedInstStream += offset;
+      GuestAddress += offset;
+      HostAddress += offset;
       return *this;
     }
   };

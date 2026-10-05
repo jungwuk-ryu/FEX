@@ -1942,7 +1942,27 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
   }
 
   uint32_t* PC = (uint32_t*)ProgramCounter;
-  uint32_t Instr = PC[0];
+  uint32_t Instr = IsJIT ? std::atomic_ref<uint32_t>(PC[0]).load(std::memory_order_acquire) : PC[0];
+
+  if (HandleType == UnalignedHandlerType::HalfBarrierTSOOnly) {
+    // The caller authenticates PC[-1..1] and the current block tail before
+    // entering this path. Restrict it to code repair: no guest-memory access,
+    // split-lock emulation, allocation, or logging is safe in the Unix handler.
+    const bool TSO = (Instr & LDAXR_MASK) == LDAR_INST || (Instr & LDAXR_MASK) == LDAPR_INST ||
+                     (Instr & LDAXR_MASK) == STLR_INST || (Instr & RCPC2_MASK) == LDAPUR_INST ||
+                     (Instr & RCPC2_MASK) == STLUR_INST;
+    const bool PatchedLoad = (Instr & LDSTREGISTER_MASK) == LDR_INST || (Instr & LDSTUNSCALED_MASK) == LDUR_INST;
+    const bool PatchedStore = (Instr & LDSTREGISTER_MASK) == STR_INST || (Instr & LDSTUNSCALED_MASK) == STUR_INST;
+    if (!IsJIT || (!TSO && !PatchedLoad && !PatchedStore)) {
+      return std::nullopt;
+    }
+    if (PatchedLoad && std::atomic_ref<uint32_t>(PC[1]).load(std::memory_order_acquire) != DMB_LD) {
+      return std::nullopt;
+    }
+    if (PatchedStore && std::atomic_ref<uint32_t>(PC[-1]).load(std::memory_order_acquire) != DMB) {
+      return std::nullopt;
+    }
+  }
 
   // 1 = 16bit
   // 2 = 32bit
@@ -2204,7 +2224,9 @@ std::optional<int32_t> HandleUnalignedAccess(FEXCore::Core::InternalThreadState*
     }
   }
 
-  LogMan::Msg::EFmt("Unhandled JIT SIGBUS: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
+  if (HandleType != UnalignedHandlerType::HalfBarrierTSOOnly) {
+    LogMan::Msg::EFmt("Unhandled JIT SIGBUS: PC: 0x{:x} Instruction: 0x{:08x}\n", ProgramCounter, PC[0]);
+  }
   return std::nullopt;
 }
 

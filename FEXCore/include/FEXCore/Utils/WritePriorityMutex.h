@@ -4,7 +4,9 @@
 #include <cstdint>
 #include <limits.h>
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+#include <unistd.h>
+#elif !defined(_WIN32)
 #include <linux/futex.h> /* Definition of FUTEX_* constants */
 #include <sys/syscall.h> /* Definition of SYS_* constants */
 #include <unistd.h>
@@ -271,7 +273,23 @@ public:
 
 private:
 
-#if !defined(_WIN32)
+#if defined(__APPLE__)
+  void FutexWaitForWriteAvailable(uint32_t Expected) {
+    std::atomic_ref<uint32_t>(Futex).wait(Expected, std::memory_order_acquire);
+  }
+
+  void FutexWaitForReadAvailable(uint32_t Expected) {
+    std::atomic_ref<uint32_t>(Futex).wait(Expected, std::memory_order_acquire);
+  }
+
+  void FutexWakeWriter() {
+    std::atomic_ref<uint32_t>(Futex).notify_one();
+  }
+
+  void FutexWakeReaders() {
+    std::atomic_ref<uint32_t>(Futex).notify_all();
+  }
+#elif !defined(_WIN32)
   void FutexWaitForWriteAvailable(uint32_t Expected) {
     ::syscall(SYS_futex, &Futex, FUTEX_PRIVATE_FLAG | FUTEX_WAIT_BITSET, Expected, nullptr, nullptr, FUTEX_BITSET_WAIT_WRITERS);
   }

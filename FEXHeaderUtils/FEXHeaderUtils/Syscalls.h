@@ -7,7 +7,11 @@
 #include <sched.h>
 #include <signal.h>
 #include <stdio.h>
-#ifndef _WIN32
+#include <limits>
+#if defined(__APPLE__)
+#include <cerrno>
+#include <pthread.h>
+#elif !defined(_WIN32)
 #include <syscall.h>
 #else
 #include <processthreadsapi.h>
@@ -51,7 +55,49 @@ namespace FHU::Syscalls {
 #define SYS_pidfd_open 434
 #endif
 
-#ifndef _WIN32
+#if defined(__APPLE__)
+inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
+  if (cpu) {
+    *cpu = 0;
+  }
+  if (node) {
+    *node = 0;
+  }
+  return 0;
+}
+
+inline int32_t gettid() {
+  uint64_t thread_id {};
+  if (pthread_threadid_np(nullptr, &thread_id) != 0) {
+    return -1;
+  }
+  if (thread_id > static_cast<uint64_t>(std::numeric_limits<int32_t>::max())) {
+    errno = EOVERFLOW;
+    return -1;
+  }
+  return static_cast<int32_t>(thread_id);
+}
+
+inline int32_t tgkill(pid_t, pid_t, int) {
+  errno = ENOTSUP;
+  return -1;
+}
+
+inline int32_t statx(int, const char*, int32_t, uint32_t, void*) {
+  errno = ENOTSUP;
+  return -1;
+}
+
+inline int32_t renameat2(int, const char*, int, const char*, unsigned int) {
+  errno = ENOTSUP;
+  return -1;
+}
+
+inline int32_t pidfd_open(pid_t, unsigned int) {
+  errno = ENOTSUP;
+  return -1;
+}
+#elif !defined(_WIN32)
 inline int32_t getcpu(uint32_t* cpu, uint32_t* node) {
   // Third argument is unused
 #if defined(HAS_SYSCALL_GETCPU) && HAS_SYSCALL_GETCPU

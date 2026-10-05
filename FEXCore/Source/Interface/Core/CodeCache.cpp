@@ -46,11 +46,11 @@ MappedCodeCacheFile::~MappedCodeCacheFile() {
     CacheManager->UnregisterMappedCodeBuffer(*this);
   }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   if (!CodeBuffer.empty()) {
     FEXCore::Allocator::munmap(CodeBuffer.data(), CodeBuffer.size_bytes());
   }
-#elif defined(_M_ARM64EC)
+#elif defined(_M_ARM64EC) || defined(__APPLE__)
   if (!CodeBuffer.empty()) {
     FEXCore::Allocator::VirtualFree(CodeBuffer.data(), CodeBuffer.size_bytes());
   }
@@ -655,7 +655,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
   Cursor = reinterpret_cast<std::byte*>(AlignUp(reinterpret_cast<uintptr_t>(Cursor), Utils::FEX_PAGE_SIZE));
   auto CodeDataInFile = std::span {Cursor, header.CodeBufferSize};
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   // Allocate target memory for post-relocation code. This is PROT_NONE until
   // the first execution, so that contents can be lazily populated in a
   // frontend-provided segfault handler.
@@ -665,7 +665,7 @@ CodeCache::LoadCache(std::span<std::byte> CacheFile, const ExecutableFileInfo& F
     return nullptr;
   }
   auto CodeBuffer = std::span {static_cast<std::byte*>(CodeBufferAllocation), header.CodeBufferSize};
-#elif defined(_M_ARM64EC)
+#elif defined(_M_ARM64EC) || defined(__APPLE__)
   // TODO: Implement lazy mapping on Windows
   // NOTE: The executed code must have MEM_EXTENDED_PARAMETER_EC_CODE set, so we can't operate on the mapped cache file directly
   void* CodeBufferAllocation = Allocator::VirtualAlloc(header.CodeBufferSize, true);
@@ -793,7 +793,7 @@ bool CodeCache::EnableLoadedSection(Core::InternalThreadState* Thread, MappedCod
     }
   }
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   if (!EnableLazyCodeCaching || EnableCodeCacheValidation) {
 #else
   // TODO: Implement lazy mapping on Windows
@@ -888,6 +888,7 @@ std::span<std::byte> AbstractCodeCache::SelectCodeRangeToFinalize(MappedCodeCach
 namespace FEXCore::Context {
 
 void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte> CodeRange) {
+  FEXCore::Allocator::ScopedJITWrite WriteScope;
   const size_t StartOffset = CodeRange.data() - Code.CodeBuffer.data();
   const auto StartPage = StartOffset / Utils::FEX_PAGE_SIZE;
   const auto EndPage = StartPage + CodeRange.size_bytes() / Utils::FEX_PAGE_SIZE;
@@ -899,7 +900,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
 
   FEXCORE_PROFILE_SCOPED("FinalizeCodePages");
 
-#ifndef _WIN32
+#if !defined(_WIN32) && !defined(__APPLE__)
   // Atomicity is critical when making the finalized code data visible.
   // We ensure this by remapping a temporary buffer onto the PROT_NONE
   // placeholder page in CodeBuffer. Some constraints to keep in mind are:
@@ -944,7 +945,7 @@ void CodeCache::FinalizeCodePages(MappedCodeCacheFile& Code, std::span<std::byte
   Allocator::VirtualDontNeed(Code.CodeBufferInFile.data() + StartOffset, Size);
 #else
   // TODO: Implement lazy mapping on Windows
-#ifdef _M_ARM64EC
+#if defined(_M_ARM64EC) || defined(__APPLE__)
   memcpy(Code.CodeBuffer.data() + StartOffset, Code.CodeBufferInFile.data() + StartOffset, Size);
 #endif
   for (size_t i = StartPage; i < EndPage; ++i) {

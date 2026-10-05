@@ -38,6 +38,7 @@ enum class SyscallOSABI {
   OS_LINUX64,
   OS_LINUX32,
   OS_GENERIC, // No JIT-side argument handling, spill/fill all regs.
+  OS_GENERIC_STOP, // OS_GENERIC plus a prompt return to the embedding after the handler.
 };
 
 struct ExecutableRangeInfo {

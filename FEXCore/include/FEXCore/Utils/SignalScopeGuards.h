@@ -156,10 +156,25 @@ private:
 class ScopedSignalMasker final {
 public:
   explicit ScopedSignalMasker(uint64_t Mask)
+#ifdef __APPLE__
+    : OriginalMask(std::in_place) {
+    sigset_t NativeMask;
+    sigemptyset(&NativeMask);
+    for (int Signal = 1; Signal < NSIG && Signal <= 64; ++Signal) {
+      if (Mask & (1ULL << (Signal - 1))) {
+        sigaddset(&NativeMask, Signal);
+      }
+    }
+    if (pthread_sigmask(SIG_SETMASK, &NativeMask, &*OriginalMask) != 0) {
+      OriginalMask.reset();
+    }
+  }
+#else
     : OriginalMask(0) {
     // Mask all signals, storing the original incoming mask
     ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &Mask, &*OriginalMask, sizeof(*OriginalMask));
   }
+#endif
 
   // Move-only type
   ScopedSignalMasker(const ScopedSignalMasker&) = delete;
@@ -171,11 +186,19 @@ public:
 
   ~ScopedSignalMasker() {
     if (OriginalMask) {
+#ifdef __APPLE__
+      pthread_sigmask(SIG_SETMASK, &*OriginalMask, nullptr);
+#else
       ::syscall(SYS_rt_sigprocmask, SIG_SETMASK, &OriginalMask, nullptr, sizeof(*OriginalMask));
+#endif
     }
   }
 private:
+#ifdef __APPLE__
+  std::optional<sigset_t> OriginalMask {};
+#else
   std::optional<uint64_t> OriginalMask {};
+#endif
 };
 
 /**

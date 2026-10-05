@@ -101,6 +101,15 @@ static inline uint64_t LoadExclusive(uint64_t* Futex) {
   return Result;
 }
 
+#ifdef __APPLE__
+static inline unsigned long LoadExclusive(unsigned long* Futex) {
+  unsigned long Result {};
+  __asm volatile(SPINLOOP_WFE_LDX_64BIT : [Result] "=r"(Result), [Futex] "+r"(Futex)::"memory");
+
+  return Result;
+}
+#endif
+
 static inline uint8_t WFELoadAtomic(uint8_t* Futex) {
   uint8_t Result {};
   __asm volatile(SPINLOOP_8BIT : [Result] "=r"(Result), [Futex] "+r"(Futex)::"memory");
@@ -128,6 +137,15 @@ static inline uint64_t WFELoadAtomic(uint64_t* Futex) {
 
   return Result;
 }
+
+#ifdef __APPLE__
+static inline unsigned long WFELoadAtomic(unsigned long* Futex) {
+  unsigned long Result {};
+  __asm volatile(SPINLOOP_64BIT : [Result] "=r"(Result), [Futex] "+r"(Futex)::"memory");
+
+  return Result;
+}
+#endif
 
 template<typename Pred, typename T>
 static inline void WaitPred(T* Futex, T ComparisonValue) {

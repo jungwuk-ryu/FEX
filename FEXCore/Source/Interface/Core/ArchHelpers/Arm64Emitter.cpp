@@ -41,7 +41,7 @@ namespace FEXCore::CPU {
 //    r19-r29 and SP.
 
 namespace x64 {
-#ifndef ARCHITECTURE_arm64ec
+#if !defined(ARCHITECTURE_arm64ec) && !defined(FEXCORE_ARM64EC_REGISTER_ABI)
   // All but x19 and x29 are caller saved
   // Note that rax/rdx are rearranged here so we can coalesce cmpxchg.
   constexpr std::array<ARMEmitter::Register, 18> SRA = {
@@ -73,21 +73,28 @@ namespace x64 {
     ARMEmitter::Reg::r8, ARMEmitter::Reg::r16, ARMEmitter::Reg::r17,
   };
 
-  constexpr std::array<ARMEmitter::Register, 7> RA = {
+  constexpr std::array RA = {
     // All these callee saved
     ARMEmitter::Reg::r20, ARMEmitter::Reg::r21, ARMEmitter::Reg::r22, ARMEmitter::Reg::r23,
-    ARMEmitter::Reg::r24, ARMEmitter::Reg::r30, ARMEmitter::Reg::r18,
+    ARMEmitter::Reg::r24, ARMEmitter::Reg::r30,
+#ifndef __APPLE__
+    // Darwin reserves x18 as its platform register.  It must never become a
+    // dynamic guest register, even when generated code does not call C++.
+    ARMEmitter::Reg::r18,
+#endif
   };
 
   constexpr unsigned RAPairs = 4;
 
   // Dynamic GPRs
-  constexpr std::array<ARMEmitter::Register, 2> PreserveAll_Dynamic = {
+  constexpr std::array PreserveAll_Dynamic = {
+#ifndef __APPLE__
     ARMEmitter::Reg::r18,
+#endif
     ARMEmitter::Reg::r30,
   };
 
-  constexpr std::array<ARMEmitter::Register, 2> NotPreserved_Dynamic = PreserveAll_Dynamic;
+  constexpr auto NotPreserved_Dynamic = PreserveAll_Dynamic;
 
   // All are caller saved
   constexpr std::array<ARMEmitter::VRegister, 16> SRAFPR = {
@@ -356,6 +363,38 @@ namespace x32 {
     ARMEmitter::VReg::v29, ARMEmitter::VReg::v30, ARMEmitter::VReg::v31};
 } // namespace x32
 
+void Arm64Emitter::EnterCustomABI() {
+  if (!EmitterCTX->Config.CustomABITransition) return;
+  ldr(ARMEmitter::XReg::lr, STATE, offsetof(FEXCore::Core::CpuStateFrame, EnterCustomABI));
+  blr(ARMEmitter::Reg::r30);
+  ldr(ARMEmitter::XReg::x18, STATE, offsetof(FEXCore::Core::CpuStateFrame, CustomABIValue));
+}
+
+void Arm64Emitter::LeaveCustomABI() {
+  if (!EmitterCTX->Config.CustomABITransition) return;
+  ldr(ARMEmitter::XReg::lr, STATE, offsetof(FEXCore::Core::CpuStateFrame, LeaveCustomABI));
+  blr(ARMEmitter::Reg::r30);
+}
+
+void Arm64Emitter::CallHostFunction(ARMEmitter::Register Function) {
+  if (!EmitterCTX->Config.CustomABITransition) {
+    blr(Function);
+    return;
+  }
+  LOGMAN_THROW_A_FMT(Function.Idx() != 18 && Function.Idx() < 30,
+                    "Host call target must survive the ABI transition");
+  // Keep this activation's custom value on its own stack, including across a
+  // reentrant host callback. Do not save or manually restore Darwin's x18.
+  stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::x18, ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, -16);
+  LeaveCustomABI();
+  blr(Function);
+  // Do not use EnterCustomABI here: restore this activation, not a frame field
+  // which a nested embedding callback may have changed.
+  ldr(ARMEmitter::XReg::lr, STATE, offsetof(FEXCore::Core::CpuStateFrame, EnterCustomABI));
+  blr(ARMEmitter::Reg::r30);
+  ldp<ARMEmitter::IndexType::POST>(ARMEmitter::XReg::x18, ARMEmitter::XReg::lr, ARMEmitter::Reg::rsp, 16);
+}
+
 // We want vixl to not allocate a default buffer. Jit and dispatcher will manually create one.
 Arm64Emitter::Arm64Emitter(FEXCore::Context::ContextImpl* ctx, void* EmissionPtr, size_t size)
   : Emitter(static_cast<uint8_t*>(EmissionPtr), size)
@@ -575,7 +614,7 @@ void Arm64Emitter::LoadConstant(ARMEmitter::Size s, ARMEmitter::Register Reg, ui
   }
 }
 
-void Arm64Emitter::PushCalleeSavedRegisters() {
+void Arm64Emitter::PushCalleeSavedRegisters(bool CustomCaller) {
   // We need to save pairs of registers
   // We save r19-r30
   constexpr static std::array<std::pair<ARMEmitter::XRegister, ARMEmitter::XRegister>, 6> CalleeSaved = {{
@@ -608,9 +647,22 @@ void Arm64Emitter::PushCalleeSavedRegisters() {
   for (const auto& [rt, rt2, rt3, rt4] : FPRs) {
     st4(ARMEmitter::SubRegSize::i64Bit, rt, rt2, rt3, rt4, 0, ARMEmitter::Reg::r19, 32);
   }
+
+  if (EmitterCTX->Config.CustomABITransition) {
+    // Per-activation, not per-thread: an ordinary thunk callback must not
+    // overwrite its custom caller's return mode. No header in system-only JIT.
+    stp<ARMEmitter::IndexType::PRE>(ARMEmitter::XReg::zr, ARMEmitter::XReg::zr, ARMEmitter::Reg::rsp, -16);
+    if (CustomCaller) {
+      mov(ARMEmitter::XReg::x19, 1);
+      str(ARMEmitter::XReg::x19, ARMEmitter::Reg::rsp);
+    }
+  }
 }
 
 void Arm64Emitter::PopCalleeSavedRegisters() {
+  if (EmitterCTX->Config.CustomABITransition) {
+    add(ARMEmitter::Size::i64Bit, ARMEmitter::Reg::rsp, ARMEmitter::Reg::rsp, 16);
+  }
   constexpr static std::array< std::tuple<ARMEmitter::DRegister, ARMEmitter::DRegister, ARMEmitter::DRegister, ARMEmitter::DRegister>, 2> FPRs = {{
     {ARMEmitter::DReg::d8, ARMEmitter::DReg::d9, ARMEmitter::DReg::d10, ARMEmitter::DReg::d11},
     {ARMEmitter::DReg::d12, ARMEmitter::DReg::d13, ARMEmitter::DReg::d14, ARMEmitter::DReg::d15},
@@ -632,6 +684,15 @@ void Arm64Emitter::PopCalleeSavedRegisters() {
   for (const auto& [rt, rt2] : CalleeSaved) {
     ldp<ARMEmitter::IndexType::POST>(rt, rt2, ARMEmitter::Reg::rsp, 16);
   }
+}
+
+void Arm64Emitter::LeaveCustomABIForCaller() {
+  if (!EmitterCTX->Config.CustomABITransition) return;
+  ARMEmitter::ForwardLabel CustomReturn;
+  ldr(TMP1, ARMEmitter::Reg::rsp);
+  (void)cbnz(ARMEmitter::Size::i64Bit, TMP1, &CustomReturn);
+  LeaveCustomABI();
+  (void)Bind(&CustomReturn);
 }
 
 void Arm64Emitter::FillSpecialRegs(ARMEmitter::Register TmpReg, ARMEmitter::Register TmpReg2, const FillSpecialRegsOptions& Options) {
